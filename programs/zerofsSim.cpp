@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-#include <utilities/isPrime.h>
+#include <isPrime.h>
 
 namespace {
 
