@@ -45,6 +45,7 @@ C implementations must enforce layout with compile-time checks:
 
 ```c
 _Static_assert(sizeof(struct zerofs_header) == 128, "zerofs_header size");
+_Static_assert(sizeof(union zerofs_object_role) == 12, "zerofs_object_role size");
 _Static_assert(sizeof(struct zerofs_object) == 16, "zerofs_object size");
 _Static_assert(sizeof(struct zerofs_attr) == 16, "zerofs_attr size");
 ```
@@ -109,13 +110,43 @@ Notes:
 ## Metadata Table Cells
 
 ```c
+union zerofs_object_role {
+    struct {
+        uint32_t data_off;
+        uint32_t size;
+        uint32_t realsize;
+    } raw;
+
+    struct {
+        uint32_t bucket_first;
+        uint32_t bucket_count;
+        uint32_t parent_n;
+    } dir;
+
+    struct {
+        uint32_t content_off;
+        uint32_t content_size;
+        uint32_t reserved0;
+    } filelike;
+
+    struct {
+        uint32_t target_index;
+        uint32_t reserved0;
+        uint32_t reserved1;
+    } hardlink;
+
+    struct {
+        uint32_t object_index;
+        uint32_t name_off;
+        uint32_t next_index;
+    } bucket;
+};
+
 struct zerofs_object {
-    uint8_t  type;        // ZEROFS_TYPE_*
+    uint8_t  type;        // ZEROFS_TYPE_* (kept first as on-disk discriminator)
     uint8_t  hash_p;      // directories: polynomial base p; otherwise 0
     uint16_t attr_index;  // attribute cell index; ignored for buckets
-    uint32_t data_off;    // role-specific (see below)
-    uint32_t size;        // role-specific (see below)
-    uint32_t realsize;    // role-specific (see below)
+    union zerofs_object_role role; // role-specific payload (12 bytes)
 };                        // exactly 16 bytes
 
 struct zerofs_attr {
@@ -141,6 +172,14 @@ struct zerofs_attr {
 Object cells and attribute cells share the same 16-byte table. Their role is
 identified by the leading `type` byte. Bucket cells are represented using the
 `zerofs_object` layout with bucket semantics described below.
+
+For compact notation in the rest of this document, `data_off`, `size`, and
+`realsize` refer to `role.raw.data_off`, `role.raw.size`, and
+`role.raw.realsize`, respectively.
+
+`type` intentionally remains at byte 0. Reordering all members by width would
+move the discriminator, change the on-disk ABI, and invalidate the existing
+bucket/type interpretation rules.
 
 Auxiliary cell rule:
 - Any cell whose `type` has `ZEROFS_TYPE_AUX` set is not a directory bucket
