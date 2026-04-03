@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -21,10 +22,11 @@ namespace {
 
 constexpr uint32_t kMaxTablesizePrime = 65521u;
 constexpr uint32_t kDirEntryHardLimit = 1u << 15; // N < 2^15
+constexpr uint32_t kBlobWord = 4u;
 
 struct FsEntry {
     uint64_t inode = 0;
-    char type = '?'; // d, -, l
+    char type = '?'; // d, -, l, p
     std::string mode;
     std::string owner;
     std::string group;
@@ -149,17 +151,48 @@ bool parseFindLsLine(const std::string& line, FsEntry& out) {
     return true;
 }
 
-std::vector<uint32_t> smallPrimesUpTo251() {
-    std::vector<uint32_t> out;
-    for (uint32_t p = 2; p <= 251; ++p) {
-        if (utilities::isPrime(p)) {
-            out.push_back(p);
-        }
-    }
-    return out;
+const std::vector<uint32_t>& fixedSmallPrimes() {
+    static const std::vector<uint32_t> kSmallPrimes = {
+        3u,   5u,   7u,   11u,  13u,  17u,  19u,  23u,  29u,  31u,  37u,  41u,  43u,  47u,
+        53u,  59u,  61u,  67u,  71u,  73u,  79u,  83u,  89u,  97u,  101u, 103u, 107u,
+        109u, 113u, 127u, 131u, 137u, 139u, 149u, 151u, 157u, 163u, 167u,
+        173u, 179u, 181u, 191u, 193u, 197u, 199u, 211u, 223u, 227u, 229u,
+        233u, 239u, 241u, 251u
+    };
+    return kSmallPrimes;
 }
 
-uint32_t zerofsHash(const std::string& name, uint32_t p, uint32_t tablesize) {
+uint32_t nextPrimeAtLeast(uint32_t n) {
+    if (n <= 2u) {
+        return 2u;
+    }
+    uint32_t candidate = (n % 2u == 0u) ? (n + 1u) : n;
+    for (;; candidate += 2u) {
+        if (utilities::isPrime(candidate)) {
+            return candidate;
+        }
+    }
+}
+
+uint32_t nextPrimeStrictlyGreater(uint32_t n) {
+    if (n < 2u) {
+        return 2u;
+    }
+    uint32_t candidate = n + 1u;
+    if (candidate <= 2u) {
+        return 2u;
+    }
+    if (candidate % 2u == 0u) {
+        ++candidate;
+    }
+    for (;; candidate += 2u) {
+        if (utilities::isPrime(candidate)) {
+            return candidate;
+        }
+    }
+}
+
+uint32_t femtofsHash(const std::string& name, uint32_t p, uint32_t tablesize) {
     if (tablesize <= 1) {
         return 0;
     }
@@ -178,7 +211,7 @@ struct Score {
 Score scoreDirectory(const std::vector<std::string>& names, uint32_t p, uint32_t tablesize) {
     std::vector<uint32_t> buckets(tablesize, 0);
     for (const auto& name : names) {
-        ++buckets[zerofsHash(name, p, tablesize)];
+        ++buckets[femtofsHash(name, p, tablesize)];
     }
     Score s;
     for (uint32_t c : buckets) {
@@ -216,8 +249,8 @@ HashChoice chooseHash(const std::vector<std::string>& names, const std::vector<u
         return out;
     }
 
-    uint32_t tablesize = n;
-    const uint32_t target = (3u * n + 1u) / 2u; // ceil(1.5 * N)
+    uint32_t tablesize = n; // phase 1: fully packed
+    const uint32_t target = nextPrimeAtLeast(2u * n);
     const uint32_t ceiling = std::min(target, kMaxTablesizePrime);
 
     double bestScore = std::numeric_limits<double>::infinity();
@@ -261,7 +294,8 @@ HashChoice chooseHash(const std::vector<std::string>& names, const std::vector<u
             return out;
         }
 
-        if (tablesize >= ceiling) {
+        const uint32_t next = nextPrimeStrictlyGreater(tablesize);
+        if (next > ceiling) {
             out.tablesize = bestSize;
             out.p = bestP;
             out.score = bestScore;
@@ -272,7 +306,7 @@ HashChoice chooseHash(const std::vector<std::string>& names, const std::vector<u
             out.hitCeiling = true;
             return out;
         }
-        ++tablesize;
+        tablesize = next;
     }
 }
 
@@ -320,7 +354,7 @@ ProgramOptions parseArgs(int argc, char** argv) {
             pageSizeSet = true;
             continue;
         }
-        throw std::runtime_error("usage: zerofsSim [inputPath] [pageSize] [--fixed-base-experiment] "
+        throw std::runtime_error("usage: femtofsSim [inputPath] [pageSize] [--fixed-base-experiment] "
                                  "[--fixed-base-samples=N] [--fixed-base-seed=N]");
     }
 
@@ -461,6 +495,32 @@ double weightedMeanSquare(const HashSimulationSummary& summary) {
         : static_cast<double>(summary.totalSumSquares) / static_cast<double>(summary.totalDirEntries);
 }
 
+double averageSuccessfulLookupStrcmp(const HashSimulationSummary& summary) {
+    if (summary.totalDirEntries == 0) {
+        return 0.0;
+    }
+    const double n = static_cast<double>(summary.totalDirEntries);
+    const double sumSquares = static_cast<double>(summary.totalSumSquares);
+    return (sumSquares + n) / (2.0 * n);
+}
+
+double averageUnsuccessfulLookupStrcmp(const HashSimulationSummary& summary) {
+    if (summary.totalDirEntries == 0) {
+        return 0.0;
+    }
+    long double weighted = 0.0L;
+    for (const auto& dir : summary.dirs) {
+        if (dir.choice.tablesize == 0 || dir.n == 0) {
+            continue;
+        }
+        const long double n = static_cast<long double>(dir.n);
+        const long double t = static_cast<long double>(dir.choice.tablesize);
+        // Entry-weighted directory selection, then uniform hash bucket in dir.
+        weighted += (n * n) / t;
+    }
+    return static_cast<double>(weighted / static_cast<long double>(summary.totalDirEntries));
+}
+
 double globalLoadFactor(const HashSimulationSummary& summary) {
     return (summary.totalBuckets == 0)
         ? 0.0
@@ -571,13 +631,26 @@ uint32_t alignUp(uint32_t x, uint32_t a) {
     return r == 0 ? x : (x + (a - r));
 }
 
+bool encodedBlobBytes(uint64_t announcedBytes, uint32_t* outEncodedBytes) {
+    if (outEncodedBytes == nullptr) {
+        return false;
+    }
+    const uint64_t withTerminator = announcedBytes + 1u;
+    const uint64_t encoded = (withTerminator + (kBlobWord - 1u)) & ~(static_cast<uint64_t>(kBlobWord) - 1u);
+    if (encoded > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    *outEncodedBytes = static_cast<uint32_t>(encoded);
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     const ProgramOptions options = parseArgs(argc, argv);
     const std::string& inputPath = options.inputPath;
     const uint32_t pageSize = options.pageSize;
-    const auto smallPrimes = smallPrimesUpTo251();
+    const auto& smallPrimes = fixedSmallPrimes();
 
     std::ifstream in(inputPath);
     if (!in) {
@@ -689,25 +762,31 @@ int main(int argc, char** argv) {
     std::unordered_map<uint64_t, uint32_t> filePathCountByInode;
     std::unordered_map<uint64_t, bool> filePayloadPublicByInode;
     std::unordered_map<uint64_t, std::string> fileAttrKeyByInode;
+    std::unordered_map<uint64_t, uint32_t> symlinkPathCountByInode;
+    std::unordered_map<uint64_t, uint32_t> fifoPathCountByInode;
+    std::unordered_map<uint64_t, std::string> fifoAttrKeyByInode;
     filePayloadByInode.reserve(4096);
     filePathCountByInode.reserve(4096);
     filePayloadPublicByInode.reserve(4096);
     fileAttrKeyByInode.reserve(4096);
+    symlinkPathCountByInode.reserve(1024);
+    fifoPathCountByInode.reserve(128);
+    fifoAttrKeyByInode.reserve(128);
 
     std::set<std::string> uniqueNames;
     std::set<std::string> uniqueSymlinkTargets;
     std::unordered_map<std::string, bool> namePublicByValue;
-    std::unordered_map<std::string, bool> stringContentPublicByValue;
     namePublicByValue.reserve(4096);
-    stringContentPublicByValue.reserve(4096);
 
     uint64_t countDir = 0;
     uint64_t countFilePath = 0;
     uint64_t countSymlink = 0;
+    uint64_t countFifoPath = 0;
     uint64_t unsupported = 0;
 
     uint64_t duplicateInodeSizeMismatch = 0;
     uint64_t duplicateInodeAttrMismatch = 0;
+    uint64_t duplicateFifoAttrMismatch = 0;
     std::set<std::string> uniqueAttrKeys;
 
     auto makeAttrKey = [](const FsEntry& e) {
@@ -723,7 +802,6 @@ int main(int argc, char** argv) {
                 uniqueNames.insert(e.name);
                 const bool publicName = isPublicFilenamePath(e);
                 namePublicByValue[e.name] = namePublicByValue[e.name] || publicName;
-                stringContentPublicByValue[e.name] = stringContentPublicByValue[e.name] || publicName;
                 uniqueAttrKeys.insert(makeAttrKey(e));
             }
             continue;
@@ -734,7 +812,6 @@ int main(int argc, char** argv) {
             uniqueNames.insert(e.name);
             const bool publicName = isPublicFilenamePath(e);
             namePublicByValue[e.name] = namePublicByValue[e.name] || publicName;
-            stringContentPublicByValue[e.name] = stringContentPublicByValue[e.name] || publicName;
             const bool publicPath = isPublicRegularFilePath(e);
             auto [it, inserted] = filePayloadByInode.emplace(e.inode, e.size);
             if (!inserted && it->second != e.size) {
@@ -755,10 +832,23 @@ int main(int argc, char** argv) {
             uniqueNames.insert(e.name);
             const bool publicName = isPublicFilenamePath(e);
             namePublicByValue[e.name] = namePublicByValue[e.name] || publicName;
-            stringContentPublicByValue[e.name] = stringContentPublicByValue[e.name] || publicName;
             uniqueSymlinkTargets.insert(e.symlinkTarget);
-            (void)stringContentPublicByValue[e.symlinkTarget];
+            ++symlinkPathCountByInode[e.inode];
             uniqueAttrKeys.insert(makeAttrKey(e));
+            continue;
+        }
+        if (e.type == 'p') {
+            ++countFifoPath;
+            dirChildren[e.parent].push_back(e.name);
+            uniqueNames.insert(e.name);
+            const bool publicName = isPublicFilenamePath(e);
+            namePublicByValue[e.name] = namePublicByValue[e.name] || publicName;
+            const std::string attrKey = makeAttrKey(e);
+            auto [attrIt, attrInserted] = fifoAttrKeyByInode.emplace(e.inode, attrKey);
+            if (!attrInserted && attrIt->second != attrKey) {
+                ++duplicateFifoAttrMismatch;
+            }
+            ++fifoPathCountByInode[e.inode];
             continue;
         }
         ++unsupported;
@@ -768,15 +858,18 @@ int main(int argc, char** argv) {
         (void)inode;
         uniqueAttrKeys.insert(attrKey);
     }
+    for (const auto& [inode, attrKey] : fifoAttrKeyByInode) {
+        (void)inode;
+        uniqueAttrKeys.insert(attrKey);
+    }
 
     // Ensure every parsed directory has a child vector, including empty dirs.
     for (const auto& d : directories) {
         (void)dirChildren[d];
     }
 
-    const HashSimulationSummary baseline = simulateHashing(directories, dirChildren, smallPrimes);
-
     uint64_t fileObjectCount = filePayloadByInode.size();
+    uint64_t fifoObjectCount = fifoPathCountByInode.size();
     uint64_t hardlinkObjectCount = 0;
     for (const auto& [inode, count] : filePathCountByInode) {
         (void)inode;
@@ -784,9 +877,60 @@ int main(int argc, char** argv) {
             hardlinkObjectCount += (count - 1);
         }
     }
+    uint64_t fifoHardlinkViolatingPaths = 0;
+    for (const auto& [inode, count] : fifoPathCountByInode) {
+        (void)inode;
+        if (count > 1) {
+            fifoHardlinkViolatingPaths += (count - 1);
+        }
+    }
+    uint64_t symlinkHardlinkViolatingPaths = 0;
+    for (const auto& [inode, count] : symlinkPathCountByInode) {
+        (void)inode;
+        if (count > 1) {
+            symlinkHardlinkViolatingPaths += (count - 1);
+        }
+    }
+
+    if (unsupported != 0 ||
+        duplicateInodeSizeMismatch != 0 ||
+        duplicateInodeAttrMismatch != 0 ||
+        duplicateFifoAttrMismatch != 0 ||
+        symlinkHardlinkViolatingPaths != 0 ||
+        fifoHardlinkViolatingPaths != 0) {
+        std::cerr << "Input violates femtoFS source-tree mapping policy:\n";
+        if (unsupported != 0) {
+            std::cerr << "  unsupported source inode kinds: " << unsupported << "\n";
+        }
+        if (duplicateInodeSizeMismatch != 0) {
+            std::cerr << "  regular-file inode size mismatches: " << duplicateInodeSizeMismatch << "\n";
+        }
+        if (duplicateInodeAttrMismatch != 0) {
+            std::cerr << "  regular-file inode attr mismatches: " << duplicateInodeAttrMismatch << "\n";
+        }
+        if (duplicateFifoAttrMismatch != 0) {
+            std::cerr << "  fifo inode attr mismatches: " << duplicateFifoAttrMismatch << "\n";
+        }
+        if (symlinkHardlinkViolatingPaths != 0) {
+            std::cerr << "  symlink hardlink violating paths: " << symlinkHardlinkViolatingPaths << "\n";
+        }
+        if (fifoHardlinkViolatingPaths != 0) {
+            std::cerr << "  fifo hardlink violating paths: " << fifoHardlinkViolatingPaths << "\n";
+        }
+        return 2;
+    }
+
+    const HashSimulationSummary baseline = simulateHashing(directories, dirChildren, smallPrimes);
     const uint64_t dirObjectCount = (countDir > 0) ? (countDir - 1) : 0; // root in header
     const uint64_t symlinkObjectCount = countSymlink;
-    const uint64_t metadataObjects = fileObjectCount + hardlinkObjectCount + dirObjectCount + symlinkObjectCount;
+    const uint64_t metadataObjects =
+        fileObjectCount + hardlinkObjectCount + dirObjectCount + symlinkObjectCount + fifoObjectCount;
+    const uint64_t filelikeRoleCount = fileObjectCount + symlinkObjectCount + fifoObjectCount;
+    const uint64_t dirRoleCount = dirObjectCount;
+    const uint64_t hardlinkRoleCount = hardlinkObjectCount;
+    const uint64_t bucketRoleCount = baseline.totalBuckets;
+    const uint64_t objectRoleCountTotal =
+        dirRoleCount + filelikeRoleCount + hardlinkRoleCount + bucketRoleCount;
     const uint64_t attrObjectCount = uniqueAttrKeys.size();
     const uint64_t attrCellsReused = std::min<uint64_t>(attrObjectCount, baseline.totalEmptyBuckets);
     const uint64_t attrCellsExtended = attrObjectCount - attrCellsReused;
@@ -805,28 +949,39 @@ int main(int argc, char** argv) {
     uint64_t privateFilePayloads = 0;
     uint64_t publicFilenameStrings = 0;
     uint64_t privateFilenameStrings = 0;
-    uint64_t publicStringContents = 0;
-    uint64_t privateStringContents = 0;
+    uint64_t publicFilenameContentBlobs = 0;
+    uint64_t privateFilenameContentBlobs = 0;
+    uint64_t privateSymlinkTargetContentBlobs = 0;
     uint64_t publicSmallFilePayloads = 0;
     uint64_t privateSmallFilePayloads = 0;
     uint64_t privateLargePartialPayloads = 0;
+    uint64_t publicZeroLenFilePayloads = 0;
+    uint64_t privateZeroLenFilePayloads = 0;
+    uint64_t payloadEncodingOverflow = 0;
+    uint64_t stringEncodingOverflow = 0;
 
     for (const auto& [inode, size] : filePayloadByInode) {
         const bool isPublic = filePayloadPublicByInode[inode];
-        if (size == 0) {
-            ++zeroLenFilePayloads;
+        uint32_t encodedSize = 0;
+        if (!encodedBlobBytes(size, &encodedSize)) {
+            ++payloadEncodingOverflow;
             continue;
         }
-        if (size <= std::numeric_limits<uint32_t>::max()) {
-            contentSizes.push_back(static_cast<uint32_t>(size));
-            classifiedContents.push_back(ClassifiedContent{static_cast<uint32_t>(size), isPublic});
-            if (isPublic) {
-                ++publicFilePayloads;
-            } else {
-                ++privateFilePayloads;
-            }
+        contentSizes.push_back(encodedSize);
+        classifiedContents.push_back(ClassifiedContent{encodedSize, isPublic});
+        if (isPublic) {
+            ++publicFilePayloads;
         } else {
-            std::cerr << "Skipping payload > 4GiB (unsupported by format): " << size << "\n";
+            ++privateFilePayloads;
+        }
+        if (size == 0) {
+            ++zeroLenFilePayloads;
+            if (isPublic) {
+                ++publicZeroLenFilePayloads;
+            } else {
+                ++privateZeroLenFilePayloads;
+            }
+            continue;
         }
         if (size < pageSize) {
             ++smallFilePayloads;
@@ -845,30 +1000,36 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::set<std::string> uniqueStringContents;
     for (const auto& name : uniqueNames) {
-        uniqueStringContents.insert(name);
         if (namePublicByValue[name]) {
             ++publicFilenameStrings;
         } else {
             ++privateFilenameStrings;
         }
-    }
-    for (const auto& target : uniqueSymlinkTargets) {
-        uniqueStringContents.insert(target);
-    }
-    for (const auto& s : uniqueStringContents) {
-        const uint64_t bytes = static_cast<uint64_t>(s.size()) + 1u;
-        if (bytes <= std::numeric_limits<uint32_t>::max()) {
-            contentSizes.push_back(static_cast<uint32_t>(bytes));
-            const bool isPublic = stringContentPublicByValue[s];
-            classifiedContents.push_back(ClassifiedContent{static_cast<uint32_t>(bytes), isPublic});
-            if (isPublic) {
-                ++publicStringContents;
-            } else {
-                ++privateStringContents;
-            }
+        uint32_t encodedSize = 0;
+        if (!encodedBlobBytes(name.size(), &encodedSize)) {
+            ++stringEncodingOverflow;
+            continue;
         }
+        const bool isPublic = namePublicByValue[name];
+        contentSizes.push_back(encodedSize);
+        classifiedContents.push_back(ClassifiedContent{encodedSize, isPublic});
+        if (isPublic) {
+            ++publicFilenameContentBlobs;
+        } else {
+            ++privateFilenameContentBlobs;
+        }
+    }
+
+    for (const auto& target : uniqueSymlinkTargets) {
+        uint32_t encodedSize = 0;
+        if (!encodedBlobBytes(target.size(), &encodedSize)) {
+            ++stringEncodingOverflow;
+            continue;
+        }
+        contentSizes.push_back(encodedSize);
+        classifiedContents.push_back(ClassifiedContent{encodedSize, false});
+        ++privateSymlinkTargetContentBlobs;
     }
 
     const PackingStats packing = packContents(contentSizes, pageSize);
@@ -881,9 +1042,10 @@ int main(int argc, char** argv) {
     const uint64_t imageBytesEstimate = static_cast<uint64_t>(contentOff) + packing.paddedBytes;
     const uint64_t splitImageBytesEstimate = static_cast<uint64_t>(contentOff) + splitPacking.combined.paddedBytes;
     const uint64_t cleanCopiedPageObjects = smallFilePayloads + largePartialPayloads;
-    const uint64_t leakingCopiedPageObjects = smallFilePayloads + privateLargePartialPayloads;
+    const uint64_t leakingCopiedPageObjects = privateSmallFilePayloads + privateLargePartialPayloads;
     const uint64_t dirtyCopiedPageObjects = privateSmallFilePayloads + privateLargePartialPayloads;
-    const uint64_t leakingDirectMapPublicObjects = publicFilePayloads - publicSmallFilePayloads;
+    const uint64_t publicMappableFilePayloads = publicFilePayloads - publicZeroLenFilePayloads;
+    const uint64_t leakingDirectMapPublicObjects = publicMappableFilePayloads;
     const uint64_t dirtyShiftedMapPublicObjects = publicSmallFilePayloads;
 
     const size_t topN = std::min<size_t>(12, baseline.dirs.size());
@@ -895,6 +1057,7 @@ int main(int argc, char** argv) {
     std::cout << "  directories (including root): " << countDir << "\n";
     std::cout << "  regular file paths:           " << countFilePath << "\n";
     std::cout << "  symlinks:                     " << countSymlink << "\n";
+    std::cout << "  fifo paths:                   " << countFifoPath << "\n";
     std::cout << "  unsupported entry types:      " << unsupported << "\n";
     if (duplicateInodeSizeMismatch != 0) {
         std::cout << "  WARNING: inode size mismatches: " << duplicateInodeSizeMismatch << "\n";
@@ -902,30 +1065,44 @@ int main(int argc, char** argv) {
     if (duplicateInodeAttrMismatch != 0) {
         std::cout << "  WARNING: inode attr mismatches: " << duplicateInodeAttrMismatch << "\n";
     }
+    if (duplicateFifoAttrMismatch != 0) {
+        std::cout << "  WARNING: fifo inode attr mismatches: " << duplicateFifoAttrMismatch << "\n";
+    }
+    if (fifoHardlinkViolatingPaths != 0) {
+        std::cout << "  WARNING: fifo hardlink violating paths: " << fifoHardlinkViolatingPaths << "\n";
+    }
     std::cout << "\n";
 
-    std::cout << "0fs object model estimate\n";
+    std::cout << "femtoFS object model estimate\n";
     std::cout << "  file objects (unique inodes): " << fileObjectCount << "\n";
     std::cout << "  hardlink objects:             " << hardlinkObjectCount << "\n";
     std::cout << "  dir objects (non-root):       " << dirObjectCount << "\n";
     std::cout << "  symlink objects:              " << symlinkObjectCount << "\n";
+    std::cout << "  fifo objects:                 " << fifoObjectCount << "\n";
     std::cout << "  metadata objects total:       " << metadataObjects << "\n";
     std::cout << "  deduped attr objects:         " << attrObjectCount << "\n";
     std::cout << "  attr cells reusing empties:   " << attrCellsReused << "\n";
     std::cout << "  attr cells extending table:   " << attrCellsExtended << "\n";
     std::cout << "  hash buckets total:           " << baseline.totalBuckets << "\n";
+    std::cout << "  object_role total:            " << objectRoleCountTotal << "\n";
+    std::cout << "    role=dir:                   " << dirRoleCount << "\n";
+    std::cout << "    role=filelike:              " << filelikeRoleCount << "\n";
+    std::cout << "    role=hardlink:              " << hardlinkRoleCount << "\n";
+    std::cout << "    role=bucket:                " << bucketRoleCount << "\n";
     std::cout << "  metadata table cells total:   " << objectTableEntries
               << " (limit < 65536)\n";
     std::cout << "  metadata table bytes:         " << prettyBytes(objectTableBytes) << "\n";
     std::cout << "\n";
 
     const double baselineWeightedMeanSquare = weightedMeanSquare(baseline);
+    const double baselineAvgSuccessfulLookupStrcmp = averageSuccessfulLookupStrcmp(baseline);
+    const double baselineAvgUnsuccessfulLookupStrcmp = averageUnsuccessfulLookupStrcmp(baseline);
     const double avgEmptiesPerDir =
         directories.empty() ? 0.0 : static_cast<double>(baseline.totalEmptyBuckets) / static_cast<double>(directories.size());
     const double baselineGlobalLoadFactor = globalLoadFactor(baseline);
 
     std::cout << "Directory hashing simulation\n";
-    std::cout << "  ceiling policy:              all sizes in [N, ceil(1.5*N)], cap " << kMaxTablesizePrime << "\n";
+    std::cout << "  ceiling policy:              all sizes in [N, next_prime(2*N)], cap " << kMaxTablesizePrime << "\n";
     std::cout << "  directories simulated:        " << directories.size() << "\n";
     std::cout << "  total dir entries (N sum):    " << baseline.totalDirEntries << "\n";
     std::cout << "  total buckets:                " << baseline.totalBuckets << "\n";
@@ -933,6 +1110,10 @@ int main(int argc, char** argv) {
     std::cout << "  avg empty buckets / dir:      " << std::fixed << std::setprecision(2) << avgEmptiesPerDir << "\n";
     std::cout << "  global load factor N/T:       " << std::fixed << std::setprecision(4) << baselineGlobalLoadFactor << "\n";
     std::cout << "  weighted mean-square chain:   " << std::fixed << std::setprecision(4) << baselineWeightedMeanSquare << "\n";
+    std::cout << "  avg strcmp per successful lookup: " << std::fixed << std::setprecision(4)
+              << baselineAvgSuccessfulLookupStrcmp << "\n";
+    std::cout << "  avg strcmp per unsuccessful lookup: " << std::fixed << std::setprecision(4)
+              << baselineAvgUnsuccessfulLookupStrcmp << "\n";
     std::cout << "  perfect-hash dirs (score=1):  " << baseline.dirsPerfect << "\n";
     std::cout << "  dirs hitting ceiling:         " << baseline.dirsHitCeiling << "\n";
     std::cout << "  dirs fallback(score>=1.1):    " << baseline.dirsFallback << "\n";
@@ -1125,33 +1306,36 @@ int main(int argc, char** argv) {
     std::cout << "  dirty shifted public objects: " << dirtyShiftedMapPublicObjects << "\n";
     std::cout << "\n";
 
-    std::cout << "Content pool packing simulation (page size " << pageSize << ")\n";
+    std::cout << "Content-part packing simulation (page size " << pageSize << ")\n";
     std::cout << "  unique payload objects:       " << filePayloadByInode.size() << "\n";
     std::cout << "  unique filename strings:      " << uniqueNames.size() << "\n";
     std::cout << "  unique symlink targets:       " << uniqueSymlinkTargets.size() << "\n";
-    std::cout << "  unique string contents total: " << uniqueStringContents.size() << "\n";
+    std::cout << "  unique string blobs total:    " << (uniqueNames.size() + uniqueSymlinkTargets.size()) << "\n";
     std::cout << "  packed contents count:        " << packing.contentCount << "\n";
-    std::cout << "  raw content bytes:            " << prettyBytes(packing.rawBytes) << "\n";
-    std::cout << "  padded content bytes:         " << prettyBytes(packing.paddedBytes) << "\n";
+    std::cout << "  stored blob bytes:            " << prettyBytes(packing.rawBytes) << "\n";
+    std::cout << "  page-packed content bytes:    " << prettyBytes(packing.paddedBytes) << "\n";
     std::cout << "  padding overhead:             " << prettyBytes(packing.paddingBytes)
               << " (" << std::fixed << std::setprecision(4)
               << ((packing.rawBytes == 0) ? 0.0 :
                   (100.0 * static_cast<double>(packing.paddingBytes) / static_cast<double>(packing.rawBytes)))
               << "%)\n";
+    std::cout << "  payload blobs overflow-skip:  " << payloadEncodingOverflow << "\n";
+    std::cout << "  string blobs overflow-skip:   " << stringEncodingOverflow << "\n";
     std::cout << "\n";
 
-    std::cout << "Visibility-split content packing\n";
+    std::cout << "Visibility-split content-part packing\n";
     std::cout << "  assumption:                   public payload needs world-read file + world-search path; public names need world-read+search path to containing dir\n";
     std::cout << "  public file payload objects:  " << publicFilePayloads << "\n";
     std::cout << "  private file payload objects: " << privateFilePayloads << "\n";
     std::cout << "  public filename strings:      " << publicFilenameStrings << "\n";
     std::cout << "  private filename strings:     " << privateFilenameStrings << "\n";
-    std::cout << "  public string contents total: " << publicStringContents << "\n";
-    std::cout << "  private string contents total:" << privateStringContents << "\n";
-    std::cout << "  public pool raw bytes:        " << prettyBytes(splitPacking.publicPool.rawBytes) << "\n";
-    std::cout << "  private pool raw bytes:       " << prettyBytes(splitPacking.privatePool.rawBytes) << "\n";
-    std::cout << "  public pool padded bytes:     " << prettyBytes(splitPacking.publicPool.paddedBytes) << "\n";
-    std::cout << "  private pool padded bytes:    " << prettyBytes(splitPacking.privatePool.paddedBytes) << "\n";
+    std::cout << "  public filename blobs:        " << publicFilenameContentBlobs << "\n";
+    std::cout << "  private filename blobs:       " << privateFilenameContentBlobs << "\n";
+    std::cout << "  private symlink blobs:        " << privateSymlinkTargetContentBlobs << "\n";
+    std::cout << "  public part stored bytes:     " << prettyBytes(splitPacking.publicPool.rawBytes) << "\n";
+    std::cout << "  private part stored bytes:    " << prettyBytes(splitPacking.privatePool.rawBytes) << "\n";
+    std::cout << "  public part packed bytes:     " << prettyBytes(splitPacking.publicPool.paddedBytes) << "\n";
+    std::cout << "  private part packed bytes:    " << prettyBytes(splitPacking.privatePool.paddedBytes) << "\n";
     std::cout << "  split padded bytes total:     " << prettyBytes(splitPacking.combined.paddedBytes) << "\n";
     std::cout << "  split padding overhead:       " << prettyBytes(splitPacking.combined.paddingBytes)
               << " (" << std::fixed << std::setprecision(4)
@@ -1168,10 +1352,10 @@ int main(int argc, char** argv) {
     std::cout << "  header bytes:                 " << headerBytes << "\n";
     std::cout << "  metadata table bytes:         " << objectTableBytes << "\n";
     std::cout << "  content_off (aligned):        " << contentOff << "\n";
-    std::cout << "  content pool bytes:           " << packing.paddedBytes << "\n";
+    std::cout << "  content region bytes:         " << packing.paddedBytes << "\n";
     std::cout << "  total image estimate:         " << prettyBytes(imageBytesEstimate)
               << " (" << imageBytesEstimate << " bytes)\n";
-    std::cout << "  split content pool bytes:     " << splitPacking.combined.paddedBytes << "\n";
+    std::cout << "  split content bytes:          " << splitPacking.combined.paddedBytes << "\n";
     std::cout << "  split image estimate:         " << prettyBytes(splitImageBytesEstimate)
               << " (" << splitImageBytesEstimate << " bytes)\n";
     std::cout << "\n";
@@ -1180,7 +1364,8 @@ int main(int argc, char** argv) {
     std::cout << "  - regular-file payload dedup estimated by inode identity (captures hardlinks).\n";
     std::cout << "  - cross-inode byte-identical dedup is unknown from find -ls and not modeled.\n";
     std::cout << "  - therefore cross-visibility promotion of identical payload bytes may be under-modeled.\n";
-    std::cout << "  - symlink-target visibility is modeled private unless promoted via identical public name bytes.\n";
+    std::cout << "  - symlink targets are modeled as private-only blobs outside payload/filename shared dedup domain.\n";
+    std::cout << "  - blob storage uses align_up(announced+1, 4) before page-packing simulation.\n";
     std::cout << "  - directory hash quality is exact for names present in input list.\n";
 
     return 0;
