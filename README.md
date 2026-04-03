@@ -7,8 +7,8 @@ from storage into userspace fast, predictably, and without dragging around the
 complexity of a writable filesystem pretending to be an appliance image.
 
 If you want a compact image that mounts cleanly, looks up paths in O(1)-style
-hashed directories, maps file data with at most one copied page, and never
-needs a repair utility, this is the point.
+hashed directories, offers clean/leaking/dirty `mmap(2)` mount modes, and
+never needs a repair utility, this is the point.
 
 ## Why It Exists
 
@@ -23,7 +23,9 @@ It is built for:
 - correct `uid`/`gid`/mode semantics for real system trees
 - deterministic lookup behavior
 - aggressive sharing of packed content bytes
-- `mmap(2)` semantics that do not leak neighboring file data
+- mode-selectable `mmap(2)` behavior:
+  - `clean` (default): no neighboring-byte exposure
+  - `leaking`/`dirty`: only public-pool neighboring bytes may be exposed
 
 That makes it a strong fit for base system payloads, installer media, rescue
 environments, embedded FreeBSD deployments, immutable appliances, VM images,
@@ -34,16 +36,18 @@ matter more than write support.
 
 `zfgfs` is intentionally small and sharp:
 
-- A whole image is just three regions: a fixed 128-byte header, a fixed-size
-  metadata table, and a content pool.
+- A whole image is four regions: fixed 128-byte header, fixed-size metadata
+  table, public content pool, private content pool.
 - Every on-disk record uses fixed-width little-endian fields. No ABI roulette.
 - Directories are hashed at build time, so lookups are cheap and predictable.
 - Object metadata preserves full Unix mode bits plus numeric `uid`/`gid`.
-- Filenames, symlink targets, and file payloads all live in one packed content
-  arena with deduplication.
-- Large files map directly from the image; only the final partial page needs a
-  copied cache page.
-- Small files need only one anonymous cached page, ever.
+- Regular-file payload and filename dedup classes can be promoted to the public
+  pool when any visible reference is public-eligible.
+- Symlink targets and metadata-extension payloads stay private-pool by policy.
+- `clean` mode copies at most one tail page per mapped file object.
+- `leaking` mode removes that copy for public-pool files.
+- `dirty` further allows shifted zero-copy for public-eligible files
+  smaller than one page.
 - There is no journal, no write path, no recovery dance, and therefore no
   `fsck` story to apologize for.
 
@@ -65,9 +69,9 @@ practical system engineering. `zfgfs` fits that culture:
   marginal on a read-only image.
 - It leaves a forward hook for future ACL and extended-attribute support
   without bloating the common case.
-- The security posture is stronger than generic packed-file layouts because
-  partial-page mappings are explicitly zero-filled instead of exposing adjacent
-  bytes.
+- Security policy is explicit and auditable: private-pool bytes are never
+  exposed by neighbor spill in any mode; only public-pool bytes may spill in
+  `leaking`/`dirty`.
 
 For maintainers, this means less policy hidden in edge cases. For users, it
 means faster cold starts, less metadata overhead, and a filesystem that behaves
@@ -89,10 +93,21 @@ like a deployable artifact instead of a tiny database.
 - Directory entries, object metadata, and deduplicated attribute records share
   the same 16-byte metadata table
 - Hardlinks resolve by canonical object index
-- Content pool packing keeps sub-page objects page-contained and page-aligns
-  large objects automatically
+- Two content pools separate spill-safe public bytes from private bytes
+- Regular-file payload classes are public/private by eligibility and dedup
+  promotion
+- Filename string classes are public/private by directory visibility and dedup
+  promotion
+- Symlink targets remain private-pool content
+- Per-pool packing keeps sub-page objects page-contained and page-aligns large
+  objects automatically
+- `mmap` mount modes:
+  - `clean` (default): page-aligned + zero-fill outside file range
+  - `leaking`: page-aligned, public-pool spill allowed
+  - `dirty`: `leaking` plus shifted zero-copy for public-eligible sub-page
+    files
 - One reserved extension pointer in each attribute record leaves room for
-  future ACL/xattr payloads in the content arena
+  future ACL/xattr payloads in private-pool content
 
 The result is a format that is easy to generate, cheap to mount, and pleasant
 to reason about under a debugger.
@@ -110,7 +125,7 @@ known-good trees efficiently and mounting them with minimal drama.
 This repository is specification-first. The core format is documented in
 [specification.md](/Users/blackye/zfgfs/specification.md), and the simulator in
 [programs/zerofsSim.cpp](/Users/blackye/zfgfs/programs/zerofsSim.cpp) explores
-hash selection and packing behavior.
+hash selection, visibility split behavior, and packing overhead.
 
 ## Pitch In One Sentence
 

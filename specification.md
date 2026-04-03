@@ -4,12 +4,15 @@ This document defines a compact, memory-friendly filesystem image format.
 
 ## Scope
 
+The aim is to provide a filesystem image format optimal for booting a "firmware-like"
+FreeBSD system in a highly resource-constrained environment.
+
 0fs is designed for:
 - FreeBSD 14+, amd64 and arm64.
 - Read-only mounts.
 - RAM-backed images (`md(4)` workflow).
 - Fast O(1) lookup by hashed directory entries.
-- `mmap(2)` with at most one copied page per file object.
+- Near-zero-copy `mmap(2)`.
 
 Design priorities:
 - Runtime lookup, read, and `mmap(2)` behavior take precedence over image-build speed.
@@ -19,7 +22,7 @@ Design priorities:
 Out of scope:
 - In-place writes.
 - Journaling.
-- ACLs and rich metadata.
+- ACLs and rich metadata (but see `zerofs_metaext` below).
 
 Hard limits:
 - Total image size `< 2^32` bytes.
@@ -28,6 +31,19 @@ Hard limits:
 - In practical trees, attr deduplication and non-pathological hash occupancy should
   allow visible object counts much closer to `< 2^16`.
 - Entries in a single directory `< 2^15`.
+
+Near-zero-copy `mmap(2)` is exposed through three mount modes:
+- `dirty`: zero-copy mapping for publicly readable and publicly reachable files.
+  May return non-page-aligned offsets and may expose neighboring bytes outside
+  the requested file range. Those neighboring bytes must come only from the
+  public pool.
+- `leaking`: page-aligned mappings only. Preserves zero-copy behavior for
+  practically mappable public files (typically `>= PAGE_SIZE`) and may expose
+  neighboring bytes outside the requested range, again only from the public
+  pool.
+- `clean` (default): POSIX-style behavior. Returned mappings are page-aligned
+  and bytes outside file bounds are zero-filled. This may require copying at
+  most one page per mapped file object.
 
 ---
 
@@ -54,13 +70,16 @@ _Static_assert(sizeof(struct zerofs_attr) == 16, "zerofs_attr size");
 
 ## Format Overview
 
-The image is a single contiguous blob with three regions, in order:
+The image is a single contiguous blob with four regions, in order:
 
 1. Header (fixed, 128 bytes).
 2. Metadata table (fixed cells, 16 bytes each).
-3. Content pool (file bytes, filenames, symlink targets).
+3. Public content pool (bytes safe to leak in `dirty`/`leaking`).
+4. Private content pool (all other bytes).
 
-All offsets are byte offsets relative to image start.
+Header offsets are byte offsets relative to image start.
+Pool offsets (`data_off`, bucket `name_off`, `ext_off`, `acl_off`, `xattr_off`)
+are relative to the start of their referenced pool.
 
 The metadata table serves a triple role:
 - object metadata (`file`, `dir`, `symlink`, `hardlink`)
@@ -82,7 +101,8 @@ struct zerofs_header {
     uint16_t reserved;       // must be 0
 
     uint32_t cell_count;     // number of entries in metadata table
-    uint32_t content_off;    // content pool byte offset (must be page-aligned)
+    uint32_t public_off;     // public content pool offset (page-aligned)
+    uint32_t private_off;    // private content pool offset (page-aligned)
     uint32_t meta_size;      // metadata table size in bytes
     uint32_t meta_hash;      // integrity hash over metadata table
 
@@ -93,13 +113,19 @@ struct zerofs_header {
     uint8_t  root_p;         // root polynomial base p
     uint8_t  root_pad;       // must be 0
 
-    uint8_t  author[88];     // NUL-terminated, zero-padded
+    uint8_t  author[84];     // NUL-terminated, zero-padded
 };                           // exactly 128 bytes
 ```
 
 Notes:
 - Header starts at byte 0.
 - Metadata table starts at byte 128.
+- Public pool starts at `public_off`.
+- Private pool starts at `private_off`.
+- `private_off >= public_off`.
+- `public_off >= 128 + meta_size`.
+- Dual-pool layout changes the on-disk header and therefore requires a format
+  `version` bump relative to the single-pool layout.
 - `meta_hash` is a sanity check (non-cryptographic hash such as FNV-1a or
   xxHash32).
 - Root descriptor is in header because root has no parent bucket entry.
@@ -124,9 +150,9 @@ union zerofs_object_role {
     } dir;
 
     struct {
-        uint32_t content_off;
+        uint32_t pool_off;
         uint32_t content_size;
-        uint32_t reserved0;
+        uint32_t flags;
     } filelike;
 
     struct {
@@ -155,7 +181,7 @@ struct zerofs_attr {
     uint16_t mode;        // st_mode bits (type + perms + suid/sgid/sticky)
     uint32_t uid;         // numeric owner
     uint32_t gid;         // numeric group
-    uint32_t ext_off;     // 0 or byte offset of zerofs_metaext in content pool
+    uint32_t ext_off;     // 0 or byte offset of zerofs_metaext in private pool
 };                        // exactly 16 bytes
 ```
 
@@ -211,6 +237,14 @@ metadata.
 #define ZEROFS_DIR_PACK(parent, n) \
     (((uint32_t)(parent) & ZEROFS_DIR_PARENT_MASK) | \
      ((((uint32_t)(n)) & 0x7FFFu) << ZEROFS_DIR_N_SHIFT))
+
+#define ZEROFS_POOL_PRIVATE       0u
+#define ZEROFS_POOL_PUBLIC        1u
+#define ZEROFS_FILELIKE_POOL_MASK 0x00000001u
+#define ZEROFS_FILELIKE_GET_POOL(x) \
+    ((uint8_t)((x) & ZEROFS_FILELIKE_POOL_MASK))
+#define ZEROFS_FILELIKE_PACK(pool) \
+    ((uint32_t)(pool) & ZEROFS_FILELIKE_POOL_MASK)
 ```
 
 ### Entry Roles
@@ -225,7 +259,7 @@ Metadata rules:
   directly.
 - `zerofs_attr.ext_off == 0` means there is no extended metadata.
 - `zerofs_attr.ext_off != 0` points to a structured metadata-extension record
-  in the content pool (see `zerofs_metaext` below).
+  in the private pool (see `zerofs_metaext` below).
 
 `ZEROFS_TYPE_DIR`:
 - `attr_index`: attribute cell index for this directory
@@ -235,9 +269,11 @@ Metadata rules:
 
 `ZEROFS_TYPE_FILE` and `ZEROFS_TYPE_SYMLINK`:
 - `attr_index`: attribute cell index for this object
-- `data_off`: byte offset into content pool
+- `data_off`: byte offset into selected content pool
 - `size`: byte length
-- `realsize`: `0`
+- `realsize`: filelike flags
+  - bit `[0]`: pool selector (`0 = private`, `1 = public`)
+  - bits `[31:1]`: reserved, must be `0`
 
 `ZEROFS_TYPE_HARDLINK`:
 - `attr_index`: `0` (ignored; attributes come from target object)
@@ -279,7 +315,7 @@ Occupied bucket:
 - `hash_p`: `0` (unused in bucket role)
 - `attr_index`: `0` (unused in bucket role)
 - `data_off`: referenced object index
-- `size`: filename offset in content pool (NUL-terminated string)
+- `size`: filename offset in private pool (NUL-terminated string)
 - `realsize`: next bucket index in chain, or `tablesize` as end sentinel
 
 Empty bucket:
@@ -329,8 +365,8 @@ metadata without affecting the common case.
 struct zerofs_metaext {
     uint16_t version;      // extension record version
     uint16_t kind_flags;   // ZEROFS_METAEXT_* bits
-    uint32_t acl_off;      // 0 or content-pool offset of ACL payload
-    uint32_t xattr_off;    // 0 or content-pool offset of xattr payload
+    uint32_t acl_off;      // 0 or private-pool offset of ACL payload
+    uint32_t xattr_off;    // 0 or private-pool offset of xattr payload
     uint32_t payload_size; // total bytes owned by this extension record
 };                         // exactly 16 bytes
 ```
@@ -342,7 +378,7 @@ struct zerofs_metaext {
 
 Rules:
 - `ext_off == 0` means no ACLs and no extended attributes.
-- `ext_off != 0` points to `zerofs_metaext` stored in the content pool.
+- `ext_off != 0` points to `zerofs_metaext` stored in the private pool.
 - ACL and xattr payload encoding is versioned by `zerofs_metaext.version`.
 - Readers that do not support a referenced extension record must reject mount
   or object activation as unsupported.
@@ -391,7 +427,7 @@ if (buckets[idx].type == ZEROFS_TYPE_NULL)
     return ENOENT;
 
 for (;;) {
-    name = content_pool + buckets[idx].size;
+    name = private_pool + buckets[idx].size;
     if (strcmp(name, query) == 0)
         return &cell_table[buckets[idx].data_off];
     if (buckets[idx].realsize == tablesize)
@@ -468,17 +504,27 @@ Notes:
 
 ---
 
-## Content Pool
+## Content Pools
 
-The content pool is an unstructured byte arena containing:
-- regular file data
-- filenames (NUL-terminated, deduplicated)
-- symlink target strings
+The image uses two content pools:
+- Public pool: bytes that are safe to expose in `dirty`/`leaking` neighbor
+  spill (publicly readable and publicly reachable regular-file data).
+- Private pool: all other bytes.
+
+The builder must classify regular files as follows:
+- Public-eligible only if the file has world-read (`S_IROTH`) and every
+  directory on at least one exported path to that file has world-search
+  (`S_IXOTH`).
+- If a file fails either condition, its payload must go to the private pool.
+
+By policy, filenames, symlink targets, and metadata-extension payloads are
+always stored in the private pool.
 
 Interpretation is determined by references, not embedded tags.
 
-### Packing Algorithm
+### Packing Algorithm (Per Pool)
 
+Each pool is packed independently with the same algorithm.
 All contents are sorted descending by size.
 A sorted free-hole set (by hole size, then offset) tracks page-padding gaps.
 
@@ -488,57 +534,66 @@ For each content:
 2. If no hole fits, append at tail.
 3. If append would straddle page, advance tail to next page and record gap.
 
-Consequences:
+Consequences (per pool):
 - Contents `>= PAGE_SIZE` become page-aligned by construction.
 - Holes are always `< PAGE_SIZE`.
 - Sub-page contents stay page-contained.
 
 ### Deduplication
 
-Identical byte sequences are stored once (SHA-512 keyed dedup in builder).
-Multiple objects may reference the same content bytes.
+Identical byte sequences may be deduplicated only within the same pool.
+Cross-pool deduplication is forbidden.
 
 ---
 
-## `mmap(2)` Contract (No-Leak Policy)
+## `mmap(2)` Contract by Mount Mode
 
-0fs intentionally uses stricter policy than generic FreeBSD `mmap` behavior.
+Common constraints:
+- Filesystem is read-only; writable mappings are rejected.
+- Only regular files are mappable.
 
-Accepted mapping constraints:
+Pool-aware eligibility:
+- If a file's payload is in the public pool, the mount mode may choose direct
+  mapping with neighbor spill according to rules below.
+- If a file's payload is in the private pool, implementation must use clean
+  behavior (no private-byte spill), even when mount mode is `dirty` or
+  `leaking`.
+
+`clean` mode (default):
 - `offset` must be page-aligned, otherwise `EINVAL`.
-- filesystem is read-only; writeable mappings are rejected.
-
-Serving policy:
-- File size `< PAGE_SIZE`: map from one cached anonymous page
-  containing file bytes + zero-fill remainder. This page is the
-  object's final page and therefore also the only copied page.
+- File size `< PAGE_SIZE`: map from one cached anonymous page containing file
+  bytes plus zero-fill remainder.
 - File size `>= PAGE_SIZE` and not page-multiple: map full leading pages
-  directly from image, map final partial page from one cached
-  anonymous page (tail bytes + zero-fill).
+  directly from image, map final partial page from one cached anonymous page
+  (tail bytes plus zero-fill).
 - File size page-multiple: fully direct-mapped from image.
 
+`leaking` mode:
+- `offset` must be page-aligned, otherwise `EINVAL`.
+- Public-pool files can skip tail-page copy and map directly even when the
+  final page is partial.
+- Any bytes outside file bounds that become visible must originate from the
+  public pool.
+
+`dirty` mode:
+- Non-page-aligned `offset` is allowed.
+- Public-pool files can be directly mapped without page alignment and without
+  tail-page copy.
+- Any bytes outside file bounds that become visible must originate from the
+  public pool.
+
 Operational summary:
-- A mapped file object needs at most one synthetic cached page: its last page.
-- That cached page is populated lazily on first use, then reused across later
-  mappings of the same copied source region.
-- For file objects smaller than `PAGE_SIZE`, the last-page cache page is the
-  entire mapping payload.
+- Clean behavior copies at most one page per mapped file object (its final
+  page), populated lazily and cacheable.
+- Leaking/dirty modes can avoid that copy for public-pool files.
+- Private-pool files never leak neighboring bytes in any mount mode.
 
-Anonymous-page cache key:
-- key by stable source location of the copied bytes, i.e. image-relative
-  offset of the first copied byte (`src_first_byte_off`), not by raw
-  on-disk `data_off` field and not by transient physical address.
-- this naturally shares cached pages across hardlinks and deduplicated
-  file contents whenever the copied source region is identical.
-- implementation may also record `copied_len` in the cache entry as a
-  runtime consistency check.
-
-Security and performance properties:
-- No bytes from neighboring packed contents are exposed through file mappings.
-- Returned addresses are page-aligned under accepted constraints.
-- At most one page is copied per mapped file object, namely the final page.
-- The copied final page is cached lazily on first use and reused across
-  subsequent mappings of the same copied source region.
+Anonymous-page cache key for clean behavior:
+- Key by stable source location of copied bytes, i.e. image-relative offset of
+  the first copied byte (`src_first_byte_off`) plus selected pool identity.
+- This naturally shares cached pages across hardlinks and deduplicated file
+  contents whenever copied source region and pool are identical.
+- Implementation may also record `copied_len` as a consistency check.
 
 ---
 
@@ -550,7 +605,9 @@ Header and metadata table:
 - `zerofs_attr` is exactly 16 bytes.
 - No inter-record padding.
 
-Content pool:
-- `content_off` must be page-aligned.
+Content pools:
+- `public_off` and `private_off` must be page-aligned.
+- `private_off` marks the start of the private pool and therefore the end of
+  the public pool.
 - Contents `>= PAGE_SIZE` are page-aligned by packing algorithm.
 - Contents `< PAGE_SIZE` must remain page-contained.

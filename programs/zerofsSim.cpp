@@ -607,18 +607,44 @@ int main(int argc, char** argv) {
         entryByPath[e.path] = &e;
     }
 
-    std::unordered_map<std::string, bool> publicDirectoryByPath;
-    publicDirectoryByPath.reserve(entries.size());
+    std::unordered_map<std::string, bool> publicSearchableDirectoryByPath;
+    publicSearchableDirectoryByPath.reserve(entries.size());
+    std::unordered_map<std::string, bool> publicReadableSearchableDirectoryByPath;
+    publicReadableSearchableDirectoryByPath.reserve(entries.size());
 
-    std::function<bool(const std::string&)> isPublicDirectory = [&](const std::string& path) -> bool {
-        const auto memoIt = publicDirectoryByPath.find(path);
-        if (memoIt != publicDirectoryByPath.end()) {
+    std::function<bool(const std::string&)> isPublicSearchableDirectory = [&](const std::string& path) -> bool {
+        const auto memoIt = publicSearchableDirectoryByPath.find(path);
+        if (memoIt != publicSearchableDirectoryByPath.end()) {
             return memoIt->second;
         }
 
         const auto entryIt = entryByPath.find(path);
         if (entryIt == entryByPath.end() || entryIt->second->type != 'd') {
-            publicDirectoryByPath[path] = false;
+            publicSearchableDirectoryByPath[path] = false;
+            return false;
+        }
+
+        const FsEntry& e = *entryIt->second;
+        bool visible = false;
+        if (path.empty()) {
+            visible = otherExec(e);
+        } else {
+            visible = isPublicSearchableDirectory(e.parent) && otherExec(e);
+        }
+
+        publicSearchableDirectoryByPath[path] = visible;
+        return visible;
+    };
+
+    std::function<bool(const std::string&)> isPublicReadableSearchableDirectory = [&](const std::string& path) -> bool {
+        const auto memoIt = publicReadableSearchableDirectoryByPath.find(path);
+        if (memoIt != publicReadableSearchableDirectoryByPath.end()) {
+            return memoIt->second;
+        }
+
+        const auto entryIt = entryByPath.find(path);
+        if (entryIt == entryByPath.end() || entryIt->second->type != 'd') {
+            publicReadableSearchableDirectoryByPath[path] = false;
             return false;
         }
 
@@ -627,21 +653,30 @@ int main(int argc, char** argv) {
         if (path.empty()) {
             visible = otherRead(e) && otherExec(e);
         } else {
-            visible = isPublicDirectory(e.parent) && otherRead(e) && otherExec(e);
+            visible = isPublicReadableSearchableDirectory(e.parent) && otherRead(e) && otherExec(e);
         }
 
-        publicDirectoryByPath[path] = visible;
+        publicReadableSearchableDirectoryByPath[path] = visible;
         return visible;
     };
 
-    auto isPublicEntryPath = [&](const FsEntry& e) -> bool {
-        if (e.path.empty()) {
-            return e.type == 'd' && otherRead(e) && otherExec(e);
-        }
-        if (!isPublicDirectory(e.parent) || !otherRead(e)) {
+    // A file payload is public-eligible iff one reachable path has world-read
+    // on the file and world-search on each directory along the path.
+    auto isPublicRegularFilePath = [&](const FsEntry& e) -> bool {
+        if (e.type != '-') {
             return false;
         }
-        return e.type != 'd' || otherExec(e);
+        if (!otherRead(e)) {
+            return false;
+        }
+        return isPublicSearchableDirectory(e.parent);
+    };
+
+    auto isPublicFilenamePath = [&](const FsEntry& e) -> bool {
+        if (e.path.empty()) {
+            return false;
+        }
+        return isPublicReadableSearchableDirectory(e.parent);
     };
 
     std::set<std::string> directories;
@@ -686,8 +721,9 @@ int main(int argc, char** argv) {
             if (!e.path.empty()) {
                 dirChildren[e.parent].push_back(e.name);
                 uniqueNames.insert(e.name);
-                namePublicByValue[e.name] = namePublicByValue[e.name] || isPublicEntryPath(e);
-                stringContentPublicByValue[e.name] = stringContentPublicByValue[e.name] || isPublicEntryPath(e);
+                const bool publicName = isPublicFilenamePath(e);
+                namePublicByValue[e.name] = namePublicByValue[e.name] || publicName;
+                stringContentPublicByValue[e.name] = stringContentPublicByValue[e.name] || publicName;
                 uniqueAttrKeys.insert(makeAttrKey(e));
             }
             continue;
@@ -696,9 +732,10 @@ int main(int argc, char** argv) {
             ++countFilePath;
             dirChildren[e.parent].push_back(e.name);
             uniqueNames.insert(e.name);
-            const bool publicPath = isPublicEntryPath(e);
-            namePublicByValue[e.name] = namePublicByValue[e.name] || publicPath;
-            stringContentPublicByValue[e.name] = stringContentPublicByValue[e.name] || publicPath;
+            const bool publicName = isPublicFilenamePath(e);
+            namePublicByValue[e.name] = namePublicByValue[e.name] || publicName;
+            stringContentPublicByValue[e.name] = stringContentPublicByValue[e.name] || publicName;
+            const bool publicPath = isPublicRegularFilePath(e);
             auto [it, inserted] = filePayloadByInode.emplace(e.inode, e.size);
             if (!inserted && it->second != e.size) {
                 ++duplicateInodeSizeMismatch;
@@ -716,8 +753,9 @@ int main(int argc, char** argv) {
             ++countSymlink;
             dirChildren[e.parent].push_back(e.name);
             uniqueNames.insert(e.name);
-            namePublicByValue[e.name] = namePublicByValue[e.name] || isPublicEntryPath(e);
-            stringContentPublicByValue[e.name] = stringContentPublicByValue[e.name] || isPublicEntryPath(e);
+            const bool publicName = isPublicFilenamePath(e);
+            namePublicByValue[e.name] = namePublicByValue[e.name] || publicName;
+            stringContentPublicByValue[e.name] = stringContentPublicByValue[e.name] || publicName;
             uniqueSymlinkTargets.insert(e.symlinkTarget);
             (void)stringContentPublicByValue[e.symlinkTarget];
             uniqueAttrKeys.insert(makeAttrKey(e));
@@ -769,6 +807,9 @@ int main(int argc, char** argv) {
     uint64_t privateFilenameStrings = 0;
     uint64_t publicStringContents = 0;
     uint64_t privateStringContents = 0;
+    uint64_t publicSmallFilePayloads = 0;
+    uint64_t privateSmallFilePayloads = 0;
+    uint64_t privateLargePartialPayloads = 0;
 
     for (const auto& [inode, size] : filePayloadByInode) {
         const bool isPublic = filePayloadPublicByInode[inode];
@@ -789,10 +830,18 @@ int main(int argc, char** argv) {
         }
         if (size < pageSize) {
             ++smallFilePayloads;
+            if (isPublic) {
+                ++publicSmallFilePayloads;
+            } else {
+                ++privateSmallFilePayloads;
+            }
         } else if ((size % pageSize) == 0) {
             ++largePageAlignedPayloads;
         } else {
             ++largePartialPayloads;
+            if (!isPublic) {
+                ++privateLargePartialPayloads;
+            }
         }
     }
 
@@ -831,6 +880,11 @@ int main(int argc, char** argv) {
     const uint32_t contentOff = alignUp(headerBytes + static_cast<uint32_t>(objectTableBytes), pageSize);
     const uint64_t imageBytesEstimate = static_cast<uint64_t>(contentOff) + packing.paddedBytes;
     const uint64_t splitImageBytesEstimate = static_cast<uint64_t>(contentOff) + splitPacking.combined.paddedBytes;
+    const uint64_t cleanCopiedPageObjects = smallFilePayloads + largePartialPayloads;
+    const uint64_t leakingCopiedPageObjects = smallFilePayloads + privateLargePartialPayloads;
+    const uint64_t dirtyCopiedPageObjects = privateSmallFilePayloads + privateLargePartialPayloads;
+    const uint64_t leakingDirectMapPublicObjects = publicFilePayloads - publicSmallFilePayloads;
+    const uint64_t dirtyShiftedMapPublicObjects = publicSmallFilePayloads;
 
     const size_t topN = std::min<size_t>(12, baseline.dirs.size());
 
@@ -1059,13 +1113,16 @@ int main(int argc, char** argv) {
         std::cout << "\n";
     }
 
-    const uint64_t copiedPageEligibleObjects = smallFilePayloads + largePartialPayloads;
     std::cout << "mmap copy-page profile (per canonical file object)\n";
     std::cout << "  small (<PAGE_SIZE):           " << smallFilePayloads << "\n";
     std::cout << "  large page-multiple:          " << largePageAlignedPayloads << "\n";
     std::cout << "  large with tail page:         " << largePartialPayloads << "\n";
     std::cout << "  zero-length payload objects:  " << zeroLenFilePayloads << "\n";
-    std::cout << "  objects requiring copied page:" << copiedPageEligibleObjects << "\n";
+    std::cout << "  clean copied-page objects:    " << cleanCopiedPageObjects << "\n";
+    std::cout << "  leaking copied-page objects:  " << leakingCopiedPageObjects << "\n";
+    std::cout << "  dirty copied-page objects:    " << dirtyCopiedPageObjects << "\n";
+    std::cout << "  leaking direct public objects:" << leakingDirectMapPublicObjects << "\n";
+    std::cout << "  dirty shifted public objects: " << dirtyShiftedMapPublicObjects << "\n";
     std::cout << "\n";
 
     std::cout << "Content pool packing simulation (page size " << pageSize << ")\n";
@@ -1084,7 +1141,7 @@ int main(int argc, char** argv) {
     std::cout << "\n";
 
     std::cout << "Visibility-split content packing\n";
-    std::cout << "  assumption:                   public means world-reachable path; symlink targets stay non-public unless also public names\n";
+    std::cout << "  assumption:                   public payload needs world-read file + world-search path; public names need world-read+search path to containing dir\n";
     std::cout << "  public file payload objects:  " << publicFilePayloads << "\n";
     std::cout << "  private file payload objects: " << privateFilePayloads << "\n";
     std::cout << "  public filename strings:      " << publicFilenameStrings << "\n";
@@ -1122,6 +1179,8 @@ int main(int argc, char** argv) {
     std::cout << "Assumptions\n";
     std::cout << "  - regular-file payload dedup estimated by inode identity (captures hardlinks).\n";
     std::cout << "  - cross-inode byte-identical dedup is unknown from find -ls and not modeled.\n";
+    std::cout << "  - therefore cross-visibility promotion of identical payload bytes may be under-modeled.\n";
+    std::cout << "  - symlink-target visibility is modeled private unless promoted via identical public name bytes.\n";
     std::cout << "  - directory hash quality is exact for names present in input list.\n";
 
     return 0;
