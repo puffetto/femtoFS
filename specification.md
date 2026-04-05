@@ -15,7 +15,7 @@ femtoFS is designed for:
 - Near-zero-copy `mmap(2)`.
 
 Design priorities:
-- Runtime lookup, read, and `mmap(2)` behavior take precedence over image build speed.
+- Runtime performance for lookup, read, and `mmap(2)` behavior take precedence over image build speed.
 - Builder work must remain reasonable, but offline search and packing costs are acceptable.
 - Primary optimization targets are runtime performance and final image size.
 
@@ -46,6 +46,15 @@ Near-zero-copy `mmap(2)` is exposed through three mount modes:
 - `clean` (default): POSIX-style behavior. Returned mappings are page-aligned
   and bytes outside file bounds are zero-filled. This may require copying at
   most one page per mapped file object.
+
+Security note:
+- In this version, public/private classification is defined only by classic
+  Unix ownership+permission visibility rules on exported paths.
+- If a future version makes ACL/MAC policy semantics active for access control,
+  implementations should force `clean` mode unless the public/private
+  classifier is extended to include those policies.
+- Otherwise, `leaking`/`dirty` could expose neighboring bytes that are
+  world-visible by mode bits but denied by ACL/MAC policy.
 
 ---
 
