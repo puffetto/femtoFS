@@ -133,8 +133,8 @@ known-good trees efficiently and mounting them with minimal drama.
 ## Repository Status
 
 This repository is specification-first. The core format is documented in
-[specification.md](/Users/blackye/zfgfs/specification.md), and the simulator in
-[programs/femtofsSim.cpp](/Users/blackye/zfgfs/programs/femtofsSim.cpp) explores
+[specification.md](specification.md), and the simulator in
+[programs/femtofsSim.cpp](programs/femtofsSim.cpp) explores
 hash selection, visibility split behavior, and packing overhead.
 
 ## Pitch In One Sentence
