@@ -91,6 +91,35 @@ struct ProgramOptions {
     bool fixedBaseExperiment = false;
     size_t fixedBaseSamples = 100;
     uint32_t fixedBaseSeed = 0x0F5F2026u;
+    bool doubleHashExperiment = true;
+    size_t doubleHashSamples = 100;
+    uint32_t doubleHashSeed = 0x0F5F2026u;
+    uint32_t doubleHashHardThreshold = 2u;
+    bool budgetedHashExperiment = true;
+    uint32_t budgetedTargetMaxChain = 2u;
+    std::vector<uint32_t> budgetedBudgetsKiB = {0u, 64u, 128u, 256u, 512u};
+};
+
+struct DirectoryHashCandidateSet {
+    std::string path;
+    uint32_t n = 0;
+    std::vector<HashChoice> choices; // baseline policy choice is at index 0
+};
+
+struct BudgetedHashTuningResult {
+    HashSimulationSummary summary;
+    uint64_t budgetBuckets = 0;
+    uint64_t usedBuckets = 0;
+    uint64_t upgradesApplied = 0;
+    uint64_t directoriesChanged = 0;
+};
+
+struct MixedDoubleHashResult {
+    HashSimulationSummary summary;
+    uint64_t hardDirectories = 0;
+    uint64_t hardEntries = 0;
+    double unsuccessfulOneProbe = 0.0;
+    double unsuccessfulTwoProbe = 0.0;
 };
 
 std::string normalizePath(const std::string& raw) {
@@ -323,6 +352,24 @@ HashChoice chooseHashWithFixedFallback(const std::vector<std::string>& names,
     return fallback;
 }
 
+std::vector<uint32_t> parseU32Csv(const std::string& csv) {
+    std::vector<uint32_t> values;
+    std::stringstream ss(csv);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        if (token.empty()) {
+            throw std::runtime_error("invalid empty value in CSV list: " + csv);
+        }
+        values.push_back(static_cast<uint32_t>(std::stoul(token)));
+    }
+    if (values.empty()) {
+        throw std::runtime_error("empty CSV list");
+    }
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    return values;
+}
+
 ProgramOptions parseArgs(int argc, char** argv) {
     ProgramOptions opts;
     bool inputSet = false;
@@ -344,6 +391,47 @@ ProgramOptions parseArgs(int argc, char** argv) {
             opts.fixedBaseSeed = static_cast<uint32_t>(std::stoul(arg.substr(18)));
             continue;
         }
+        if (arg == "--double-hash-experiment") {
+            opts.doubleHashExperiment = true;
+            continue;
+        }
+        if (arg == "--no-double-hash-experiment") {
+            opts.doubleHashExperiment = false;
+            continue;
+        }
+        if (arg.rfind("--double-hash-samples=", 0) == 0) {
+            opts.doubleHashExperiment = true;
+            opts.doubleHashSamples = static_cast<size_t>(std::stoul(arg.substr(22)));
+            continue;
+        }
+        if (arg.rfind("--double-hash-seed=", 0) == 0) {
+            opts.doubleHashExperiment = true;
+            opts.doubleHashSeed = static_cast<uint32_t>(std::stoul(arg.substr(19)));
+            continue;
+        }
+        if (arg.rfind("--double-hash-hard-threshold=", 0) == 0) {
+            opts.doubleHashExperiment = true;
+            opts.doubleHashHardThreshold = static_cast<uint32_t>(std::stoul(arg.substr(29)));
+            continue;
+        }
+        if (arg == "--budgeted-hash-experiment") {
+            opts.budgetedHashExperiment = true;
+            continue;
+        }
+        if (arg == "--no-budgeted-hash-experiment") {
+            opts.budgetedHashExperiment = false;
+            continue;
+        }
+        if (arg.rfind("--budgeted-budgets-kib=", 0) == 0) {
+            opts.budgetedHashExperiment = true;
+            opts.budgetedBudgetsKiB = parseU32Csv(arg.substr(23));
+            continue;
+        }
+        if (arg.rfind("--budgeted-target-max-chain=", 0) == 0) {
+            opts.budgetedHashExperiment = true;
+            opts.budgetedTargetMaxChain = static_cast<uint32_t>(std::stoul(arg.substr(28)));
+            continue;
+        }
         if (!inputSet) {
             opts.inputPath = arg;
             inputSet = true;
@@ -355,7 +443,12 @@ ProgramOptions parseArgs(int argc, char** argv) {
             continue;
         }
         throw std::runtime_error("usage: femtofsSim [inputPath] [pageSize] [--fixed-base-experiment] "
-                                 "[--fixed-base-samples=N] [--fixed-base-seed=N]");
+                                 "[--fixed-base-samples=N] [--fixed-base-seed=N] "
+                                 "[--double-hash-experiment|--no-double-hash-experiment] "
+                                 "[--double-hash-samples=N] [--double-hash-seed=N] "
+                                 "[--double-hash-hard-threshold=N] "
+                                 "[--budgeted-hash-experiment|--no-budgeted-hash-experiment] "
+                                 "[--budgeted-budgets-kib=a,b,c] [--budgeted-target-max-chain=N]");
     }
 
     return opts;
@@ -487,6 +580,566 @@ HashSimulationSummary simulateHashingWithFixedFallback(
     });
 
     return summary;
+}
+
+Score scoreDirectoryTwoChoiceBalanced(const std::vector<std::string>& names,
+                                      uint32_t p1,
+                                      uint32_t p2,
+                                      uint32_t tablesize) {
+    std::vector<uint32_t> buckets(tablesize, 0);
+    for (const auto& name : names) {
+        const uint32_t i1 = femtofsHash(name, p1, tablesize);
+        const uint32_t i2 = femtofsHash(name, p2, tablesize);
+        uint32_t chosen = i1;
+        if (buckets[i2] < buckets[i1] || (buckets[i2] == buckets[i1] && i2 < i1)) {
+            chosen = i2;
+        }
+        ++buckets[chosen];
+    }
+    Score s;
+    for (uint32_t c : buckets) {
+        if (c == 0) {
+            continue;
+        }
+        s.sumSquares += static_cast<uint64_t>(c) * static_cast<uint64_t>(c);
+        s.maxChain = std::max(s.maxChain, c);
+    }
+    return s;
+}
+
+HashChoice chooseHashTwoChoiceBalanced(const std::vector<std::string>& names,
+                                       const std::vector<uint32_t>& bases,
+                                       uint32_t p2) {
+    HashChoice out;
+    const uint32_t n = static_cast<uint32_t>(names.size());
+
+    if (n == 0) {
+        out.tablesize = 0;
+        out.p = 0;
+        out.score = 0.0;
+        out.maxChain = 0;
+        out.sumSquares = 0;
+        out.empties = 0;
+        out.ceiling = 0;
+        return out;
+    }
+    if (n == 1) {
+        out.tablesize = 1;
+        out.p = 0;
+        out.score = 1.0;
+        out.maxChain = 1;
+        out.sumSquares = 1;
+        out.empties = 0;
+        out.ceiling = 1;
+        return out;
+    }
+
+    const uint32_t target = nextPrimeAtLeast(2u * n);
+    const uint32_t ceiling = std::min(target, kMaxTablesizePrime);
+
+    bool hasBest = false;
+    uint32_t bestP = 0;
+    uint32_t bestSize = n;
+    uint32_t bestMaxChain = std::numeric_limits<uint32_t>::max();
+    uint64_t bestSumSquares = std::numeric_limits<uint64_t>::max();
+
+    auto consider = [&](uint32_t p1, uint32_t tablesize, const Score& s) {
+        const bool take =
+            !hasBest ||
+            s.maxChain < bestMaxChain ||
+            (s.maxChain == bestMaxChain && s.sumSquares < bestSumSquares) ||
+            (s.maxChain == bestMaxChain && s.sumSquares == bestSumSquares && tablesize < bestSize) ||
+            (s.maxChain == bestMaxChain && s.sumSquares == bestSumSquares && tablesize == bestSize && p1 < bestP);
+        if (!take) {
+            return;
+        }
+        hasBest = true;
+        bestP = p1;
+        bestSize = tablesize;
+        bestMaxChain = s.maxChain;
+        bestSumSquares = s.sumSquares;
+    };
+
+    uint32_t tablesize = n;
+    for (;;) {
+        for (uint32_t p1 : bases) {
+            const Score s = scoreDirectoryTwoChoiceBalanced(names, p1, p2, tablesize);
+            consider(p1, tablesize, s);
+        }
+
+        if (bestMaxChain <= 1) {
+            break;
+        }
+        const uint32_t next = nextPrimeStrictlyGreater(tablesize);
+        if (next > ceiling) {
+            break;
+        }
+        tablesize = next;
+    }
+
+    out.tablesize = bestSize;
+    out.p = bestP;
+    out.score = static_cast<double>(bestSumSquares) / static_cast<double>(n);
+    out.maxChain = bestMaxChain;
+    out.sumSquares = bestSumSquares;
+    out.empties = bestSize - n;
+    out.ceiling = ceiling;
+    out.hitCeiling = (bestSize == ceiling && out.score >= 1.1);
+    return out;
+}
+
+HashSimulationSummary simulateHashingTwoChoiceBalanced(
+    const std::set<std::string>& directories,
+    const std::unordered_map<std::string, std::vector<std::string>>& dirChildren,
+    const std::vector<uint32_t>& bases,
+    uint32_t p2) {
+    HashSimulationSummary summary;
+    summary.dirs.reserve(directories.size());
+
+    for (const auto& d : directories) {
+        const auto& names = dirChildren.at(d);
+        const uint32_t n = static_cast<uint32_t>(names.size());
+        if (n >= kDirEntryHardLimit) {
+            ++summary.dirsOverHardLimit;
+        }
+
+        HashChoice hc = chooseHashTwoChoiceBalanced(names, bases, p2);
+        if (hc.score == 1.0 && n > 0) {
+            ++summary.dirsPerfect;
+        }
+        if (hc.hitCeiling) {
+            ++summary.dirsHitCeiling;
+            if (hc.score >= 1.1) {
+                ++summary.dirsFallback;
+            }
+        }
+
+        summary.totalDirEntries += n;
+        summary.totalBuckets += hc.tablesize;
+        summary.totalEmptyBuckets += hc.empties;
+        summary.totalSumSquares += hc.sumSquares;
+        summary.globalMaxChain = std::max(summary.globalMaxChain, hc.maxChain);
+
+        summary.dirs.push_back(DirReport{d.empty() ? "/" : d, n, hc});
+    }
+
+    std::sort(summary.dirs.begin(), summary.dirs.end(), [](const DirReport& a, const DirReport& b) {
+        if (a.choice.maxChain != b.choice.maxChain) {
+            return a.choice.maxChain > b.choice.maxChain;
+        }
+        if (a.choice.score != b.choice.score) {
+            return a.choice.score > b.choice.score;
+        }
+        return a.n > b.n;
+    });
+
+    return summary;
+}
+
+std::unordered_map<std::string, HashChoice> buildSingleHashChoiceByDirectoryKey(
+    const std::set<std::string>& directories,
+    const std::unordered_map<std::string, std::vector<std::string>>& dirChildren,
+    const std::vector<uint32_t>& bases) {
+    std::unordered_map<std::string, HashChoice> byDir;
+    byDir.reserve(directories.size() * 2);
+    for (const auto& d : directories) {
+        const auto& names = dirChildren.at(d);
+        byDir.emplace(d, chooseHash(names, bases));
+    }
+    return byDir;
+}
+
+MixedDoubleHashResult simulateHashingMixedDoubleHash(
+    const std::set<std::string>& directories,
+    const std::unordered_map<std::string, std::vector<std::string>>& dirChildren,
+    const std::unordered_map<std::string, HashChoice>& singleChoicesByDir,
+    const std::vector<uint32_t>& bases,
+    uint32_t p2,
+    uint32_t hardThreshold) {
+    MixedDoubleHashResult out;
+    out.summary.dirs.reserve(directories.size());
+
+    long double weightedOne = 0.0L;
+    long double weightedTwo = 0.0L;
+
+    for (const auto& d : directories) {
+        const auto& names = dirChildren.at(d);
+        const uint32_t n = static_cast<uint32_t>(names.size());
+        if (n >= kDirEntryHardLimit) {
+            ++out.summary.dirsOverHardLimit;
+        }
+
+        const auto singleIt = singleChoicesByDir.find(d);
+        if (singleIt == singleChoicesByDir.end()) {
+            throw std::runtime_error("internal error: missing single-hash choice for directory");
+        }
+
+        const HashChoice single = singleIt->second;
+        const bool isHard = (single.maxChain > hardThreshold);
+        const HashChoice hc = isHard ? chooseHashTwoChoiceBalanced(names, bases, p2) : single;
+
+        if (isHard) {
+            ++out.hardDirectories;
+            out.hardEntries += n;
+        }
+
+        if (hc.score == 1.0 && n > 0) {
+            ++out.summary.dirsPerfect;
+        }
+        if (hc.hitCeiling) {
+            ++out.summary.dirsHitCeiling;
+            if (hc.score >= 1.1) {
+                ++out.summary.dirsFallback;
+            }
+        }
+
+        out.summary.totalDirEntries += n;
+        out.summary.totalBuckets += hc.tablesize;
+        out.summary.totalEmptyBuckets += hc.empties;
+        out.summary.totalSumSquares += hc.sumSquares;
+        out.summary.globalMaxChain = std::max(out.summary.globalMaxChain, hc.maxChain);
+        out.summary.dirs.push_back(DirReport{d.empty() ? "/" : d, n, hc});
+
+        if (n > 0 && hc.tablesize > 0) {
+            const long double nl = static_cast<long double>(n);
+            const long double tl = static_cast<long double>(hc.tablesize);
+            const long double unit = (nl * nl) / tl;
+            weightedOne += unit;
+            weightedTwo += isHard ? (2.0L * unit) : unit;
+        }
+    }
+
+    std::sort(out.summary.dirs.begin(), out.summary.dirs.end(), [](const DirReport& a, const DirReport& b) {
+        if (a.choice.maxChain != b.choice.maxChain) {
+            return a.choice.maxChain > b.choice.maxChain;
+        }
+        if (a.choice.score != b.choice.score) {
+            return a.choice.score > b.choice.score;
+        }
+        return a.n > b.n;
+    });
+
+    if (out.summary.totalDirEntries > 0) {
+        const long double denom = static_cast<long double>(out.summary.totalDirEntries);
+        out.unsuccessfulOneProbe = static_cast<double>(weightedOne / denom);
+        out.unsuccessfulTwoProbe = static_cast<double>(weightedTwo / denom);
+    }
+
+    return out;
+}
+
+HashChoice chooseBestForFixedTableSize(const std::vector<std::string>& names,
+                                       const std::vector<uint32_t>& bases,
+                                       uint32_t tablesize,
+                                       uint32_t ceiling) {
+    HashChoice out;
+    const uint32_t n = static_cast<uint32_t>(names.size());
+    if (n == 0) {
+        out.tablesize = 0;
+        out.p = 0;
+        out.score = 0.0;
+        out.maxChain = 0;
+        out.sumSquares = 0;
+        out.empties = 0;
+        out.ceiling = 0;
+        return out;
+    }
+    if (n == 1) {
+        const uint32_t ts = (tablesize == 0) ? 1u : tablesize;
+        out.tablesize = ts;
+        out.p = 0;
+        out.score = 1.0;
+        out.maxChain = 1;
+        out.sumSquares = 1;
+        out.empties = ts - 1u;
+        out.ceiling = ceiling;
+        out.hitCeiling = (ts == ceiling && out.score >= 1.1);
+        return out;
+    }
+
+    bool hasBest = false;
+    uint32_t bestP = 0;
+    Score bestScore;
+
+    for (uint32_t p : bases) {
+        const Score s = scoreDirectory(names, p, tablesize);
+        if (!hasBest ||
+            s.maxChain < bestScore.maxChain ||
+            (s.maxChain == bestScore.maxChain && s.sumSquares < bestScore.sumSquares) ||
+            (s.maxChain == bestScore.maxChain && s.sumSquares == bestScore.sumSquares && p < bestP)) {
+            hasBest = true;
+            bestP = p;
+            bestScore = s;
+        }
+    }
+
+    out.tablesize = tablesize;
+    out.p = bestP;
+    out.score = static_cast<double>(bestScore.sumSquares) / static_cast<double>(n);
+    out.maxChain = bestScore.maxChain;
+    out.sumSquares = bestScore.sumSquares;
+    out.empties = tablesize - n;
+    out.ceiling = ceiling;
+    out.hitCeiling = (tablesize == ceiling && out.score >= 1.1);
+    return out;
+}
+
+bool sameHashChoiceKey(const HashChoice& a, const HashChoice& b) {
+    return a.tablesize == b.tablesize &&
+           a.p == b.p &&
+           a.maxChain == b.maxChain &&
+           a.sumSquares == b.sumSquares;
+}
+
+void appendUniqueChoice(std::vector<HashChoice>* choices, const HashChoice& c) {
+    for (const auto& existing : *choices) {
+        if (sameHashChoiceKey(existing, c)) {
+            return;
+        }
+    }
+    choices->push_back(c);
+}
+
+std::vector<DirectoryHashCandidateSet> buildHashCandidateSets(
+    const std::set<std::string>& directories,
+    const std::unordered_map<std::string, std::vector<std::string>>& dirChildren,
+    const std::vector<uint32_t>& bases) {
+    std::vector<DirectoryHashCandidateSet> sets;
+    sets.reserve(directories.size());
+
+    for (const auto& d : directories) {
+        const auto& names = dirChildren.at(d);
+        const uint32_t n = static_cast<uint32_t>(names.size());
+        const HashChoice baseline = chooseHash(names, bases);
+
+        DirectoryHashCandidateSet set;
+        set.path = d.empty() ? "/" : d;
+        set.n = n;
+        set.choices.push_back(baseline);
+
+        if (n >= 2) {
+            const uint32_t ceiling = baseline.ceiling;
+
+            appendUniqueChoice(&set.choices, chooseBestForFixedTableSize(names, bases, n, ceiling));
+
+            for (uint32_t tablesize = nextPrimeStrictlyGreater(n);
+                 tablesize <= ceiling;
+                 tablesize = nextPrimeStrictlyGreater(tablesize)) {
+                appendUniqueChoice(&set.choices, chooseBestForFixedTableSize(names, bases, tablesize, ceiling));
+            }
+
+            if (set.choices.size() > 2) {
+                std::sort(set.choices.begin() + 1, set.choices.end(), [](const HashChoice& a, const HashChoice& b) {
+                    if (a.tablesize != b.tablesize) {
+                        return a.tablesize < b.tablesize;
+                    }
+                    if (a.maxChain != b.maxChain) {
+                        return a.maxChain < b.maxChain;
+                    }
+                    if (a.sumSquares != b.sumSquares) {
+                        return a.sumSquares < b.sumSquares;
+                    }
+                    return a.p < b.p;
+                });
+            }
+        }
+
+        sets.push_back(std::move(set));
+    }
+
+    return sets;
+}
+
+HashSimulationSummary summarizeHashChoices(const std::vector<DirectoryHashCandidateSet>& sets,
+                                          const std::vector<size_t>& selectedChoiceIndices) {
+    HashSimulationSummary summary;
+    summary.dirs.reserve(sets.size());
+
+    for (size_t i = 0; i < sets.size(); ++i) {
+        const auto& set = sets[i];
+        const auto& hc = set.choices[selectedChoiceIndices[i]];
+        const uint32_t n = set.n;
+
+        if (n >= kDirEntryHardLimit) {
+            ++summary.dirsOverHardLimit;
+        }
+        if (hc.score == 1.0 && n > 0) {
+            ++summary.dirsPerfect;
+        }
+        if (hc.hitCeiling) {
+            ++summary.dirsHitCeiling;
+            if (hc.score >= 1.1) {
+                ++summary.dirsFallback;
+            }
+        }
+
+        summary.totalDirEntries += n;
+        summary.totalBuckets += hc.tablesize;
+        summary.totalEmptyBuckets += hc.empties;
+        summary.totalSumSquares += hc.sumSquares;
+        summary.globalMaxChain = std::max(summary.globalMaxChain, hc.maxChain);
+
+        summary.dirs.push_back(DirReport{set.path, n, hc});
+    }
+
+    std::sort(summary.dirs.begin(), summary.dirs.end(), [](const DirReport& a, const DirReport& b) {
+        if (a.choice.score != b.choice.score) {
+            return a.choice.score > b.choice.score;
+        }
+        if (a.choice.maxChain != b.choice.maxChain) {
+            return a.choice.maxChain > b.choice.maxChain;
+        }
+        return a.n > b.n;
+    });
+
+    return summary;
+}
+
+BudgetedHashTuningResult runBudgetedHashTuning(const std::vector<DirectoryHashCandidateSet>& sets,
+                                               uint64_t budgetBuckets,
+                                               uint32_t targetMaxChain) {
+    BudgetedHashTuningResult result;
+    result.budgetBuckets = budgetBuckets;
+
+    if (sets.empty()) {
+        return result;
+    }
+
+    std::vector<size_t> selectedChoiceIndices(sets.size(), 0);
+    HashSimulationSummary current = summarizeHashChoices(sets, selectedChoiceIndices);
+    uint64_t usedBuckets = 0;
+    uint64_t upgradesApplied = 0;
+
+    struct Candidate {
+        bool found = false;
+        size_t dirIndex = 0;
+        size_t choiceIndex = 0;
+        uint64_t costBuckets = 0;
+        uint32_t newGlobalMaxChain = 0;
+        uint64_t newTotalSumSquares = 0;
+    };
+
+    for (;;) {
+        Candidate bestAny;
+        Candidate bestReducer;
+        const bool prioritizeMaxChainReduction =
+            (targetMaxChain > 0 && current.globalMaxChain > targetMaxChain);
+
+        auto considerCandidate = [&](Candidate* best,
+                                     size_t dirIndex,
+                                     size_t choiceIndex,
+                                     uint64_t costBuckets,
+                                     uint32_t newGlobalMaxChain,
+                                     uint64_t newTotalSumSquares) {
+            const auto& candidateChoice = sets[dirIndex].choices[choiceIndex];
+            const auto& currentBestChoice = best->found
+                ? sets[best->dirIndex].choices[best->choiceIndex]
+                : candidateChoice;
+
+            const bool take =
+                !best->found ||
+                (newGlobalMaxChain < best->newGlobalMaxChain) ||
+                (newGlobalMaxChain == best->newGlobalMaxChain &&
+                 newTotalSumSquares < best->newTotalSumSquares) ||
+                (newGlobalMaxChain == best->newGlobalMaxChain &&
+                 newTotalSumSquares == best->newTotalSumSquares &&
+                 costBuckets < best->costBuckets) ||
+                (newGlobalMaxChain == best->newGlobalMaxChain &&
+                 newTotalSumSquares == best->newTotalSumSquares &&
+                 costBuckets == best->costBuckets &&
+                 candidateChoice.tablesize < currentBestChoice.tablesize) ||
+                (newGlobalMaxChain == best->newGlobalMaxChain &&
+                 newTotalSumSquares == best->newTotalSumSquares &&
+                 costBuckets == best->costBuckets &&
+                 candidateChoice.tablesize == currentBestChoice.tablesize &&
+                 candidateChoice.p < currentBestChoice.p) ||
+                (newGlobalMaxChain == best->newGlobalMaxChain &&
+                 newTotalSumSquares == best->newTotalSumSquares &&
+                 costBuckets == best->costBuckets &&
+                 candidateChoice.tablesize == currentBestChoice.tablesize &&
+                 candidateChoice.p == currentBestChoice.p &&
+                 sets[dirIndex].path < sets[best->dirIndex].path);
+
+            if (!take) {
+                return;
+            }
+
+            best->found = true;
+            best->dirIndex = dirIndex;
+            best->choiceIndex = choiceIndex;
+            best->costBuckets = costBuckets;
+            best->newGlobalMaxChain = newGlobalMaxChain;
+            best->newTotalSumSquares = newTotalSumSquares;
+        };
+
+        for (size_t i = 0; i < sets.size(); ++i) {
+            const auto& set = sets[i];
+            const auto& currentChoice = set.choices[selectedChoiceIndices[i]];
+
+            for (size_t j = 0; j < set.choices.size(); ++j) {
+                if (j == selectedChoiceIndices[i]) {
+                    continue;
+                }
+
+                const auto& candidateChoice = set.choices[j];
+                if (candidateChoice.tablesize < currentChoice.tablesize) {
+                    continue;
+                }
+
+                const uint64_t costBuckets =
+                    static_cast<uint64_t>(candidateChoice.tablesize - currentChoice.tablesize);
+                if (costBuckets > (budgetBuckets - usedBuckets)) {
+                    continue;
+                }
+
+                uint32_t newGlobalMaxChain = 0;
+                for (size_t k = 0; k < sets.size(); ++k) {
+                    const auto& choice = (k == i)
+                        ? candidateChoice
+                        : sets[k].choices[selectedChoiceIndices[k]];
+                    newGlobalMaxChain = std::max(newGlobalMaxChain, choice.maxChain);
+                }
+
+                const uint64_t newTotalSumSquares =
+                    current.totalSumSquares - currentChoice.sumSquares + candidateChoice.sumSquares;
+
+                const bool improvesObjective =
+                    (newGlobalMaxChain < current.globalMaxChain) ||
+                    (newGlobalMaxChain == current.globalMaxChain && newTotalSumSquares < current.totalSumSquares);
+                if (!improvesObjective) {
+                    continue;
+                }
+
+                considerCandidate(&bestAny, i, j, costBuckets, newGlobalMaxChain, newTotalSumSquares);
+                if (newGlobalMaxChain < current.globalMaxChain) {
+                    considerCandidate(&bestReducer, i, j, costBuckets, newGlobalMaxChain, newTotalSumSquares);
+                }
+            }
+        }
+
+        const Candidate& best = (prioritizeMaxChainReduction && bestReducer.found) ? bestReducer : bestAny;
+        if (!best.found) {
+            break;
+        }
+
+        selectedChoiceIndices[best.dirIndex] = best.choiceIndex;
+        usedBuckets += best.costBuckets;
+        ++upgradesApplied;
+        current = summarizeHashChoices(sets, selectedChoiceIndices);
+    }
+
+    uint64_t directoriesChanged = 0;
+    for (size_t idx : selectedChoiceIndices) {
+        if (idx != 0) {
+            ++directoriesChanged;
+        }
+    }
+
+    result.summary = std::move(current);
+    result.usedBuckets = usedBuckets;
+    result.upgradesApplied = upgradesApplied;
+    result.directoriesChanged = directoriesChanged;
+    return result;
 }
 
 double weightedMeanSquare(const HashSimulationSummary& summary) {
@@ -1120,6 +1773,171 @@ int main(int argc, char** argv) {
     std::cout << "  max chain observed:           " << baseline.globalMaxChain << "\n";
     std::cout << "  dirs violating N<2^15:        " << baseline.dirsOverHardLimit << "\n";
     std::cout << "\n";
+
+    if (options.doubleHashExperiment) {
+        constexpr uint32_t kBigPrimeMin = (1u << 8) + 1u; // strictly greater than 2^8
+        constexpr uint32_t kBigPrimeMax = (1u << 24);     // strictly less than 2^24
+
+        const auto singleChoicesByDir = buildSingleHashChoiceByDirectoryKey(directories, dirChildren, smallPrimes);
+        const size_t sampleCount = std::max<size_t>(1, options.doubleHashSamples);
+        const auto sampledPrimes = sampleRandomPrimes(
+            kBigPrimeMin,
+            kBigPrimeMax,
+            sampleCount,
+            options.doubleHashSeed);
+
+        struct MixedTrial {
+            uint32_t p2 = 0;
+            MixedDoubleHashResult result;
+        };
+
+        std::vector<MixedTrial> trials;
+        trials.reserve(sampledPrimes.size());
+
+        for (uint32_t p2 : sampledPrimes) {
+            MixedDoubleHashResult result = simulateHashingMixedDoubleHash(
+                directories,
+                dirChildren,
+                singleChoicesByDir,
+                smallPrimes,
+                p2,
+                options.doubleHashHardThreshold);
+            trials.push_back(MixedTrial{p2, std::move(result)});
+        }
+
+        std::sort(trials.begin(), trials.end(), [](const MixedTrial& a, const MixedTrial& b) {
+            const auto& sa = a.result.summary;
+            const auto& sb = b.result.summary;
+            if (sa.globalMaxChain != sb.globalMaxChain) {
+                return sa.globalMaxChain < sb.globalMaxChain;
+            }
+            const double wa = weightedMeanSquare(sa);
+            const double wb = weightedMeanSquare(sb);
+            if (wa != wb) {
+                return wa < wb;
+            }
+            if (sa.totalBuckets != sb.totalBuckets) {
+                return sa.totalBuckets < sb.totalBuckets;
+            }
+            if (a.result.unsuccessfulTwoProbe != b.result.unsuccessfulTwoProbe) {
+                return a.result.unsuccessfulTwoProbe < b.result.unsuccessfulTwoProbe;
+            }
+            return a.p2 < b.p2;
+        });
+
+        const auto& bestMixed = trials.front();
+        const auto& bestSummary = bestMixed.result.summary;
+        const double bestWeightedMeanSquare = weightedMeanSquare(bestSummary);
+        const double bestAvgSuccessfulLookupStrcmp = averageSuccessfulLookupStrcmp(bestSummary);
+        const double bestGlobalLoadFactor = globalLoadFactor(bestSummary);
+        const int64_t deltaBuckets = static_cast<int64_t>(bestSummary.totalBuckets) - static_cast<int64_t>(baseline.totalBuckets);
+        const int64_t deltaMetaBytes = deltaBuckets * 16;
+        const size_t topMixedN = std::min<size_t>(8, bestSummary.dirs.size());
+
+        std::cout << "Mixed single/double-hash experiment (random big-prime search)\n";
+        std::cout << "  p1 candidates:                fixed small-prime set\n";
+        std::cout << "  p2 search range:              (" << (1u << 8) << ", " << (1u << 24) << ")\n";
+        std::cout << "  hard directory rule:          baseline max_chain > " << options.doubleHashHardThreshold << "\n";
+        std::cout << "  sampled random primes:        " << trials.size() << "\n";
+        std::cout << "  RNG seed:                     " << options.doubleHashSeed << "\n";
+        std::cout << "  best p2:                      " << bestMixed.p2 << "\n";
+        std::cout << "  hard directories switched:    " << bestMixed.result.hardDirectories
+                  << " / " << directories.size() << "\n";
+        std::cout << "  hard directories entry share: " << bestMixed.result.hardEntries
+                  << " / " << baseline.totalDirEntries << "\n";
+        std::cout << "  total buckets:                " << bestSummary.totalBuckets
+                  << " (delta " << std::showpos << deltaBuckets << std::noshowpos << ")\n";
+        std::cout << "  metadata bytes delta:         " << std::showpos << deltaMetaBytes << " B" << std::noshowpos << "\n";
+        std::cout << "  max chain observed:           " << bestSummary.globalMaxChain
+                  << " (baseline " << baseline.globalMaxChain << ")\n";
+        std::cout << "  weighted mean-square chain:   " << std::fixed << std::setprecision(4) << bestWeightedMeanSquare
+                  << " (baseline " << baselineWeightedMeanSquare << ")\n";
+        std::cout << "  global load factor N/T:       " << std::fixed << std::setprecision(4) << bestGlobalLoadFactor
+                  << " (baseline " << baselineGlobalLoadFactor << ")\n";
+        std::cout << "  avg strcmp successful:        " << std::fixed << std::setprecision(4) << bestAvgSuccessfulLookupStrcmp
+                  << " (baseline " << baselineAvgSuccessfulLookupStrcmp << ")\n";
+        std::cout << "  avg strcmp unsuccessful (1 probe model): " << std::fixed << std::setprecision(4)
+                  << bestMixed.result.unsuccessfulOneProbe << " (baseline " << baselineAvgUnsuccessfulLookupStrcmp << ")\n";
+        std::cout << "  avg strcmp unsuccessful (2 probe-on-hard model): " << std::fixed << std::setprecision(4)
+                  << bestMixed.result.unsuccessfulTwoProbe << "\n";
+
+        std::cout << "  top random-prime candidates\n";
+        std::cout << "    p2 | max_chain | weighted_ms | buckets | miss_2probe_hard\n";
+        for (size_t i = 0; i < std::min<size_t>(5, trials.size()); ++i) {
+            const auto& t = trials[i];
+            const auto& s = t.result.summary;
+            std::cout << "    " << t.p2
+                      << " | " << s.globalMaxChain
+                      << " | " << std::fixed << std::setprecision(4) << weightedMeanSquare(s)
+                      << " | " << s.totalBuckets
+                      << " | " << std::fixed << std::setprecision(4) << t.result.unsuccessfulTwoProbe
+                      << "\n";
+        }
+
+        std::cout << "  worst dirs by max_chain (best mixed)\n";
+        std::cout << "    path | N | tablesize | p1 | score | max_chain\n";
+        for (size_t i = 0; i < topMixedN; ++i) {
+            const auto& d = bestSummary.dirs[i];
+            std::cout << "    " << d.path
+                      << " | " << d.n
+                      << " | " << d.choice.tablesize
+                      << " | " << d.choice.p
+                      << " | " << std::fixed << std::setprecision(4) << d.choice.score
+                      << " | " << d.choice.maxChain
+                      << "\n";
+        }
+        std::cout << "\n";
+    }
+
+    if (options.budgetedHashExperiment) {
+        const auto hashCandidateSets = buildHashCandidateSets(directories, dirChildren, smallPrimes);
+
+        std::vector<uint32_t> budgetsKiB = options.budgetedBudgetsKiB;
+        budgetsKiB.push_back(0u);
+        std::sort(budgetsKiB.begin(), budgetsKiB.end());
+        budgetsKiB.erase(std::unique(budgetsKiB.begin(), budgetsKiB.end()), budgetsKiB.end());
+
+        std::cout << "Budgeted hash tuner (greedy)\n";
+        std::cout << "  objective:                   minimize global max chain, then total sum-squares\n";
+        std::cout << "  target max chain:            " << options.budgetedTargetMaxChain << "\n";
+        std::cout << "  profile | budget_kib | used_buckets | used_bytes | max_chain | weighted_ms | avg_strcmp_ok | avg_strcmp_miss | dirs_changed | upgrades\n";
+
+        std::cout << "  baseline-policy"
+                  << " | " << 0
+                  << " | " << 0
+                  << " | " << 0
+                  << " | " << baseline.globalMaxChain
+                  << " | " << std::fixed << std::setprecision(4) << baselineWeightedMeanSquare
+                  << " | " << std::fixed << std::setprecision(4) << baselineAvgSuccessfulLookupStrcmp
+                  << " | " << std::fixed << std::setprecision(4) << baselineAvgUnsuccessfulLookupStrcmp
+                  << " | " << 0
+                  << " | " << 0
+                  << "\n";
+
+        for (uint32_t budgetKiB : budgetsKiB) {
+            const uint64_t budgetBuckets = static_cast<uint64_t>(budgetKiB) * 64u; // 1 KiB / 16-byte bucket
+            const BudgetedHashTuningResult tuned =
+                runBudgetedHashTuning(hashCandidateSets, budgetBuckets, options.budgetedTargetMaxChain);
+
+            const double tunedWeightedMeanSquare = weightedMeanSquare(tuned.summary);
+            const double tunedAvgSuccessfulLookupStrcmp = averageSuccessfulLookupStrcmp(tuned.summary);
+            const double tunedAvgUnsuccessfulLookupStrcmp = averageUnsuccessfulLookupStrcmp(tuned.summary);
+            const uint64_t usedBytes = tuned.usedBuckets * 16u;
+
+            std::cout << "  tuned-budget"
+                      << " | " << budgetKiB
+                      << " | " << tuned.usedBuckets
+                      << " | " << usedBytes
+                      << " | " << tuned.summary.globalMaxChain
+                      << " | " << std::fixed << std::setprecision(4) << tunedWeightedMeanSquare
+                      << " | " << std::fixed << std::setprecision(4) << tunedAvgSuccessfulLookupStrcmp
+                      << " | " << std::fixed << std::setprecision(4) << tunedAvgUnsuccessfulLookupStrcmp
+                      << " | " << tuned.directoriesChanged
+                      << " | " << tuned.upgradesApplied
+                      << "\n";
+        }
+        std::cout << "\n";
+    }
 
     std::cout << "Worst directories by score\n";
     std::cout << "  path | N | tablesize | p | score | max_chain | empties | hit_ceiling\n";

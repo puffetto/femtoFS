@@ -126,10 +126,11 @@ struct femtofs_header {
     uint32_t root_size;      // root tablesize
     uint32_t root_real;      // root N (actual entry count)
     uint16_t root_attr;      // attribute cell index for root directory
-    uint8_t  root_p;         // root polynomial base p
+    uint8_t  root_p;         // root hash control byte (mode + small-prime index)
     uint8_t  root_pad;       // must be 0
+    uint32_t hash2_base;     // global second-hash base prime for dual-hash mode
 
-    uint8_t  author[84];     // NUL-terminated, zero-padded
+    uint8_t  author[80];     // NUL-terminated, zero-padded
 };                           // exactly 128 bytes
 ```
 
@@ -147,6 +148,9 @@ Notes:
   format `version` bump relative to the single-part layout.
 - `meta_hash` is a non-cryptographic integrity/sanity check.
 - Root descriptor is in header because root has no parent bucket entry.
+- `root_p` uses the same hash-control encoding as directory `hash_p` fields.
+- `hash2_base` is used only when at least one directory (including root) is in
+  dual-hash mode; otherwise it may be `0`.
 - Attribute cells may appear anywhere in the metadata table.
 
 ### Metadata Integrity Hash (`meta_hash`)
@@ -215,7 +219,7 @@ union femtofs_object_role {
 
 struct femtofs_object {
     uint8_t  type;        // FEMTOFS_TYPE_* (kept first as on-disk discriminator)
-    uint8_t  hash_p;      // directories: polynomial base p; buckets: reserved (0)
+    uint8_t  hash_p;      // directories: hash control byte; buckets: reserved (0)
     uint16_t attr_index;  // attribute cell index; ignored for buckets
     union femtofs_object_role role; // role-specific payload (12 bytes)
 };                        // exactly 16 bytes
@@ -257,6 +261,102 @@ Auxiliary cell rule:
 - Any cell whose `type` has `FEMTOFS_TYPE_AUX` set is not a directory bucket
   occupant and must be treated as empty by hash lookup and directory iteration.
 - `FEMTOFS_TYPE_ATTR` is the only defined auxiliary cell type in this version.
+
+### Field-Width Utilization Map (`femtofs_object`, v1)
+
+This subsection makes explicit where on-disk fields carry values with a smaller
+effective domain than their storage width. It is intended to show where future
+extensions could add meaning.
+
+Builder hygiene:
+- Builders should write `0` in all currently unused bytes/bits.
+- Readers should only require zero where this specification already marks fields
+  as reserved and checks them in validation rules.
+
+`femtofs_object` header fields:
+- `type` (`uint8_t`): this version defines only
+  `NULL`, `FILE`, `DIR`, `SYMLINK`, `HARDLINK`, `FIFO`, `ATTR`
+  (plus `AUX` namespace bit). Other values are unassigned.
+- `hash_p` (`uint8_t`):
+  - `DIR`: hash-control byte:
+    - bits `[5:0]` encode `p1_index` into `SMALL_PRIMES`
+    - bits `[7:6]` encode hash mode (`00` single-hash, `01` dual-hash,
+      `10/11` reserved)
+  - Bucket cells: reserved and required `0`.
+  - `FILE`/`SYMLINK`/`FIFO`/`HARDLINK`: currently unused by semantics.
+- `root_p` in the header uses the same encoding as directory `hash_p`.
+- `attr_index` (`uint16_t`):
+  - `FILE`/`DIR`/`SYMLINK`/`FIFO`: attribute-cell index `< cell_count` where
+    `cell_count < 2^16`.
+  - `HARDLINK` and bucket cells: required `0`.
+
+`union femtofs_object_role` payload fields (stored as three `uint32_t` words):
+- Word 0 (`data_off` / `bucket_first` / `image_off` / `target_index` / `object_index`):
+  - `FILE`/`SYMLINK` `image_off`: image-relative byte offset (`< 2^32`), full
+    32-bit offset domain.
+  - `DIR` `bucket_first`: metadata index (`< 2^16`), logically `u16` in `u32`.
+  - `HARDLINK` `target_index`: metadata index (`< 2^16`), logically `u16` in
+    `u32`.
+  - Bucket `object_index`: metadata index (`< 2^16`), logically `u16` in `u32`.
+  - `FIFO`: required `0`.
+- Word 1 (`size` / `bucket_count` / `content_size` / `reserved0` / `name_off`):
+  - `FILE`/`SYMLINK` `content_size`: announced size (`< 2^32`), full 32-bit
+    length domain.
+  - `DIR` `bucket_count`: `tablesize`, bounded by `<= 65521`, logically `u16`
+    in `u32`.
+  - Bucket `name_off`: image-relative byte offset (`< 2^32`), full 32-bit
+    offset domain.
+  - `HARDLINK` `reserved0`: required `0`.
+  - `FIFO`: required `0`.
+- Word 2 (`realsize` / `parent_n` / `reserved_flags` / `reserved1` / `next_index`):
+  - `DIR` `parent_n`:
+    - bits `[15:0]` parent index
+    - bits `[30:16]` `N`
+    - bit `[31]` reserved (`0`)
+  - `FILE`/`SYMLINK` `reserved_flags`: required `0` in this version (entire
+    word currently unused).
+  - `HARDLINK` `reserved1`: required `0`.
+  - Bucket `next_index`: chain next index or end sentinel `tablesize`,
+    bounded by `<= 65521`, logically `u16` in `u32`.
+  - `FIFO`: required `0`.
+
+### Directory Hash-Control Encoding (`hash_p`, `root_p`)
+
+Directory hash policy is encoded in one byte:
+- low 6 bits: `p1_index` (index into `SMALL_PRIMES`)
+- high 2 bits: hash mode
+
+```c
+#define FEMTOFS_HASH_P1IDX_MASK   0x3Fu
+#define FEMTOFS_HASH_MODE_MASK    0xC0u
+#define FEMTOFS_HASH_MODE_SHIFT   6u
+
+#define FEMTOFS_HASH_MODE_SINGLE  0u
+#define FEMTOFS_HASH_MODE_DUAL    1u
+/* 2 and 3 are reserved */
+```
+
+Interpretation:
+- `SINGLE` mode: one anchor hash (`h1`) using `p1 = SMALL_PRIMES[p1_index]`.
+- `DUAL` mode: two anchor hashes (`h1`, `h2`):
+  - `h1` uses `p1 = SMALL_PRIMES[p1_index]`
+  - `h2` uses `hash2_base` from the image header.
+- `SMALL_PRIMES` table content and order are defined in
+  "Choosing Hash Parameters at Build Time".
+
+`hash2_base` rules:
+- If any directory (including root) is in `DUAL` mode, `hash2_base` must be a
+  prime satisfying `2^8 < hash2_base < 2^24`.
+- If no directory uses `DUAL` mode, `hash2_base` may be `0`.
+
+Builder policy flexibility:
+- Builder implementations MAY choose per-directory mode (`SINGLE` vs `DUAL`)
+  and MAY classify "hard" directories using their own heuristic.
+- Builder implementations MAY test multiple candidate `hash2_base` primes in
+  the allowed range and select the best candidate.
+- Builders SHOULD choose parameters to balance lookup performance (worst-case
+  chain length and average comparisons) against metadata size (bucket count).
+- This specification does not mandate one optimizer algorithm.
 
 ### Directory Metadata Packing (`realsize`)
 
@@ -308,6 +408,7 @@ Metadata rules:
   in the private part of the content region (see `femtofs_metaext` below).
 
 `FEMTOFS_TYPE_DIR`:
+- `hash_p`: hash-control byte (`p1_index` + mode, see encoding section)
 - `attr_index`: attribute cell index for this directory
 - `data_off`: first bucket index in metadata table
 - `size`: `tablesize` (bucket count)
@@ -480,18 +581,35 @@ tablesize = dir->size;
 if (tablesize == 0)
     return ENOENT;
 
-idx = femtofs_hash(query, dir->hash_p, tablesize);
-if (buckets[idx].type == FEMTOFS_TYPE_NULL)
-    return ENOENT;
+hash_ctrl = is_root_directory ? header->root_p : dir->hash_p;
+mode = (hash_ctrl & FEMTOFS_HASH_MODE_MASK) >> FEMTOFS_HASH_MODE_SHIFT;
+p1_index = hash_ctrl & FEMTOFS_HASH_P1IDX_MASK;
+p1 = SMALL_PRIMES[p1_index];
 
-for (;;) {
-    name = image_base + buckets[idx].size;
-    if (strcmp(name, query) == 0)
-        return &cell_table[buckets[idx].data_off];
-    if (buckets[idx].realsize == tablesize)
-        return ENOENT;
-    idx = buckets[idx].realsize;
+anchors[0] = femtofs_hash(query, p1, tablesize);
+anchor_count = 1;
+if (mode == FEMTOFS_HASH_MODE_DUAL) {
+    h2 = femtofs_hash(query, header->hash2_base, tablesize);
+    if (h2 != anchors[0])
+        anchors[anchor_count++] = h2;
 }
+
+for (a = 0; a < anchor_count; ++a) {
+    idx = anchors[a];
+    if (buckets[idx].type == FEMTOFS_TYPE_NULL || (buckets[idx].type & FEMTOFS_TYPE_AUX))
+        continue;
+
+    for (;;) {
+        name = image_base + buckets[idx].size;
+        if (strcmp(name, query) == 0)
+            return &cell_table[buckets[idx].data_off];
+        if (buckets[idx].realsize == tablesize)
+            break;
+        idx = buckets[idx].realsize;
+    }
+}
+
+return ENOENT;
 ```
 
 ### Directory Listing
@@ -505,10 +623,13 @@ slice. Listing order for hash buckets is undefined.
 
 ---
 
-## Choosing `p` and `tablesize` at Build Time
+## Choosing Hash Parameters at Build Time
 
-Goal: minimize `sum_of_squares(chain_lengths) / N` while keeping table size
-small.
+Goal: minimize directory lookup cost while keeping metadata table growth small.
+
+Reference objective for single-hash mode:
+- minimize `sum_of_squares(chain_lengths) / N`
+- subject to bounded `tablesize`.
 
 Definitions:
 
@@ -520,10 +641,17 @@ SMALL_PRIMES = [
     109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167,
     173, 179, 181, 191, 193, 197, 199, 211, 223, 227, 229,
     233, 239, 241, 251
-]                       // fixed candidate set and iteration order
+]                       // fixed on-disk index map for `p1_index`
+SMALL_PRIMES_COUNT = 54
 ```
 
-Algorithm:
+### Single-Hash Reference Policy
+
+The following algorithm is informative (reference policy), not mandatory.
+Builder implementations MAY use different tuning logic, provided encoded
+outputs satisfy this specification's validation rules.
+
+Reference algorithm:
 
 ```text
 if N == 0:
@@ -539,7 +667,7 @@ tablesize   = N                           // phase 1: fully packed
 ceiling     = min(next_prime(2 * N), MAX_TABLESIZE_PRIME)
 
 loop:
-    for each p in SMALL_PRIMES:           // fixed list defined above
+    for each p in SMALL_PRIMES:
         simulate coalesced hash with (p, tablesize)
         score = sum_of_squares(chain_lengths) / N
 
@@ -567,6 +695,22 @@ Notes:
   clamps to `65521` and returns best result seen.
 - Phase 1 uses `tablesize = N` even if `N` is not prime.
 - Phase 2 grows through primes only.
+
+### Mixed Single/Dual Policy (Recommended, Not Mandated)
+
+Builder implementations MAY use a mixed policy:
+- keep `SINGLE` mode for directories that already meet target lookup quality
+- switch selected "hard" directories to `DUAL` mode.
+
+For `DUAL` mode, builder implementations MAY:
+- pick `hash2_base` as any prime in `2^8 < p < 2^24`
+- test multiple candidate primes (for example random samples) and keep the best.
+
+Builders SHOULD tune these choices to balance:
+- lookup quality (worst-case chain length and average comparisons)
+- metadata growth (extra buckets / bytes).
+
+This specification intentionally does not mandate one optimizer algorithm.
 
 ---
 
@@ -763,6 +907,9 @@ Header and top-level bounds:
 - `root_size < 2^15`, `root_real <= root_size`.
 - If `root_size == 0`, then `root_real == 0`.
 - If `root_size > 0`, then `root_first + root_size <= cell_count`.
+- Root hash control (`root_p`) must decode to:
+  - mode in `{FEMTOFS_HASH_MODE_SINGLE, FEMTOFS_HASH_MODE_DUAL}`
+  - `p1_index < SMALL_PRIMES_COUNT`.
 - `meta_hash` must exactly match
   `fnv_32_buf(image + 128, meta_size, FNV1_32_INIT)`.
 
@@ -772,6 +919,9 @@ Cell typing and reserved-bit rules:
 - Unknown non-aux types and unknown aux types must be rejected.
 - For `FILE`, `DIR`, `SYMLINK`, and `FIFO` cells:
   `attr_index < cell_count` and `cell[attr_index].type == FEMTOFS_TYPE_ATTR`.
+- For each `DIR` cell, `hash_p` must decode to:
+  - mode in `{FEMTOFS_HASH_MODE_SINGLE, FEMTOFS_HASH_MODE_DUAL}`
+  - `p1_index < SMALL_PRIMES_COUNT`.
 - For `FEMTOFS_TYPE_DIR`, `realsize` bit `[31]` must be `0`.
 - For `FEMTOFS_TYPE_DIR`, parent from `FEMTOFS_DIR_GET_PARENT(realsize)` must
   be either `FEMTOFS_PARENT_ROOT` or an in-range directory-object index.
@@ -781,6 +931,8 @@ Cell typing and reserved-bit rules:
   `realsize == 0`.
 - For `FEMTOFS_TYPE_ATTR`, `reserved0 == 0`.
 - For bucket-role occupied cells: `hash_p == 0` and `attr_index == 0`.
+- If any directory (including root) uses `FEMTOFS_HASH_MODE_DUAL`, then
+  `hash2_base` must be prime and satisfy `2^8 < hash2_base < 2^24`.
 
 Directory-slice and bucket bounds:
 - For each non-root `DIR` object:
