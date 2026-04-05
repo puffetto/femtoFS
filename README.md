@@ -130,6 +130,51 @@ extended-attribute payloads, even though the format leaves space for them
 later. If you need a mutable filesystem, use one. `femtoFS` is for shipping
 known-good trees efficiently and mounting them with minimal drama.
 
+## Example Performance on a Minimal FreeBSD Boot Image
+
+Reference inputs:
+- `femtoFS` numbers from `programs/femtofsSim` on `misc/list` (mixed hash
+  default, 4 KiB pages)
+- UFS image size from the corresponding space-optimized reference build:
+  **202,829,824 B** (**193.43 MiB**)
+
+Image footprint:
+- `femtoFS` estimated full image (public/private split): **179,139,980 B**
+  (**170.84 MiB**)
+- Delta vs UFS reference image: **-23,689,844 B** (**-11.68%**)
+
+Expected directory lookup cost for newly accessed paths:
+- Both UFS and `femtoFS` numbers below are entry-weighted (same weighting model
+  over directory entries).
+- UFS (no `dirhash`, no namecache hit): linear scan, about **`n/2`**
+  `strcmp()` on success and **`n`** on miss in a directory with `n` entries
+- On this dataset (`N=4041` entries across `252` directories), using
+  entry-weighted directory sizes: rough UFS expectation is
+  **~83.75** `strcmp()` success, **~166.49** miss
+- `femtoFS` measured (selected mixed-hash policy, same entry weighting):
+  **1.0567** success,
+  **0.7841** miss, max chain **2**, first-try hit **94.3331%**
+- Note: real UFS behavior can improve with `dirhash` and VFS namecache, but
+  both features consume additional kernel memory.
+- Why this still favors `femtoFS` on immutable images: UFS `dirhash` is a
+  runtime general-purpose accelerator built without global build-time knowledge,
+  so it cannot consistently beat a statically tuned near-perfect hash that was
+  optimized offline for the exact shipped tree. It can reduce linear-scan cost,
+  but not generally outperform image-specific static optimization.
+- Namecache is a different class (hot-path cache) and can produce very fast
+  repeated lookups; this is not exclusive to UFS. A `femtoFS` kernel
+  implementation can use VFS namecache as well.
+
+`mmap()` first-touch expectation (UFS-on-md vs `femtoFS`-on-md, `clean` mode):
+- Selection rule used for estimate: non-symlink files ending in `.so`, plus
+  regular files in `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/usr/local/bin`,
+  `/usr/local/sbin`
+- Unique payload set from that rule: **804 files**, **18,628 pages**
+- UFS-on-md: each previously non-resident touched page is materialized via
+  page-in/copy (up to touched pages)
+- `femtoFS` `clean`: expected zero-copy on **17,825 / 18,628 pages**
+  (**95.69%**), with tail-page copy path on **803 / 18,628 pages** (**4.31%**)
+
 ## Repository Status
 
 This repository is specification-first. The core format is documented in

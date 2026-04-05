@@ -1574,6 +1574,76 @@ int main(int argc, char** argv) {
     }
 
     const HashSimulationSummary baseline = simulateHashing(directories, dirChildren, smallPrimes);
+    const double baselineWeightedMeanSquare = weightedMeanSquare(baseline);
+    const double baselineAvgSuccessfulLookupStrcmp = averageSuccessfulLookupStrcmp(baseline);
+    const double baselineAvgUnsuccessfulLookupStrcmp = averageUnsuccessfulLookupStrcmp(baseline);
+    const double baselineGlobalLoadFactor = globalLoadFactor(baseline);
+
+    struct MixedTrial {
+        uint32_t p2 = 0;
+        MixedDoubleHashResult result;
+    };
+
+    std::vector<MixedTrial> mixedTrials;
+    mixedTrials.clear();
+    const MixedTrial* bestMixed = nullptr;
+
+    if (options.doubleHashExperiment) {
+        constexpr uint32_t kBigPrimeMin = (1u << 8) + 1u; // strictly greater than 2^8
+        constexpr uint32_t kBigPrimeMax = (1u << 24);     // strictly less than 2^24
+
+        const auto singleChoicesByDir = buildSingleHashChoiceByDirectoryKey(directories, dirChildren, smallPrimes);
+        const size_t sampleCount = std::max<size_t>(1, options.doubleHashSamples);
+        const auto sampledPrimes = sampleRandomPrimes(
+            kBigPrimeMin,
+            kBigPrimeMax,
+            sampleCount,
+            options.doubleHashSeed);
+
+        mixedTrials.reserve(sampledPrimes.size());
+        for (uint32_t p2 : sampledPrimes) {
+            MixedDoubleHashResult result = simulateHashingMixedDoubleHash(
+                directories,
+                dirChildren,
+                singleChoicesByDir,
+                smallPrimes,
+                p2,
+                options.doubleHashHardThreshold);
+            mixedTrials.push_back(MixedTrial{p2, std::move(result)});
+        }
+
+        std::sort(mixedTrials.begin(), mixedTrials.end(), [](const MixedTrial& a, const MixedTrial& b) {
+            const auto& sa = a.result.summary;
+            const auto& sb = b.result.summary;
+            if (sa.globalMaxChain != sb.globalMaxChain) {
+                return sa.globalMaxChain < sb.globalMaxChain;
+            }
+            const double wa = weightedMeanSquare(sa);
+            const double wb = weightedMeanSquare(sb);
+            if (wa != wb) {
+                return wa < wb;
+            }
+            if (sa.totalBuckets != sb.totalBuckets) {
+                return sa.totalBuckets < sb.totalBuckets;
+            }
+            if (a.result.unsuccessfulTwoProbe != b.result.unsuccessfulTwoProbe) {
+                return a.result.unsuccessfulTwoProbe < b.result.unsuccessfulTwoProbe;
+            }
+            return a.p2 < b.p2;
+        });
+
+        if (!mixedTrials.empty()) {
+            bestMixed = &mixedTrials.front();
+        }
+    }
+
+    const HashSimulationSummary& selectedSummary = (bestMixed == nullptr) ? baseline : bestMixed->result.summary;
+    const double selectedWeightedMeanSquare = weightedMeanSquare(selectedSummary);
+    const double selectedAvgSuccessfulLookupStrcmp = averageSuccessfulLookupStrcmp(selectedSummary);
+    const double selectedAvgUnsuccessfulLookupStrcmp = (bestMixed == nullptr)
+        ? baselineAvgUnsuccessfulLookupStrcmp
+        : bestMixed->result.unsuccessfulTwoProbe;
+    const double selectedGlobalLoadFactor = globalLoadFactor(selectedSummary);
     const uint64_t dirObjectCount = (countDir > 0) ? (countDir - 1) : 0; // root in header
     const uint64_t symlinkObjectCount = countSymlink;
     const uint64_t metadataObjects =
@@ -1581,11 +1651,11 @@ int main(int argc, char** argv) {
     const uint64_t filelikeRoleCount = fileObjectCount + symlinkObjectCount + fifoObjectCount;
     const uint64_t dirRoleCount = dirObjectCount;
     const uint64_t hardlinkRoleCount = hardlinkObjectCount;
-    const uint64_t bucketRoleCount = baseline.totalBuckets;
+    const uint64_t bucketRoleCount = selectedSummary.totalBuckets;
     const uint64_t objectRoleCountTotal =
         dirRoleCount + filelikeRoleCount + hardlinkRoleCount + bucketRoleCount;
     const uint64_t attrObjectCount = uniqueAttrKeys.size();
-    const uint64_t attrCellsReused = std::min<uint64_t>(attrObjectCount, baseline.totalEmptyBuckets);
+    const uint64_t attrCellsReused = std::min<uint64_t>(attrObjectCount, selectedSummary.totalEmptyBuckets);
     const uint64_t attrCellsExtended = attrObjectCount - attrCellsReused;
 
     // Content sizes for packing simulation.
@@ -1688,7 +1758,7 @@ int main(int argc, char** argv) {
     const PackingStats packing = packContents(contentSizes, pageSize);
     const VisibilitySplitPackingStats splitPacking = packContentsWithVisibilitySplit(classifiedContents, pageSize);
 
-    const uint64_t objectTableEntries = metadataObjects + baseline.totalBuckets + attrCellsExtended;
+    const uint64_t objectTableEntries = metadataObjects + selectedSummary.totalBuckets + attrCellsExtended;
     const uint64_t objectTableBytes = objectTableEntries * 16u;
     const uint32_t headerBytes = 128u;
     const uint32_t contentOff = alignUp(headerBytes + static_cast<uint32_t>(objectTableBytes), pageSize);
@@ -1701,7 +1771,7 @@ int main(int argc, char** argv) {
     const uint64_t leakingDirectMapPublicObjects = publicMappableFilePayloads;
     const uint64_t dirtyShiftedMapPublicObjects = publicSmallFilePayloads;
 
-    const size_t topN = std::min<size_t>(12, baseline.dirs.size());
+    const size_t topN = std::min<size_t>(12, selectedSummary.dirs.size());
 
     std::cout << "Input file: " << inputPath << "\n";
     std::cout << "Parsed lines: " << entries.size() << " (parse errors: " << parseErrors << ")\n\n";
@@ -1736,7 +1806,7 @@ int main(int argc, char** argv) {
     std::cout << "  deduped attr objects:         " << attrObjectCount << "\n";
     std::cout << "  attr cells reusing empties:   " << attrCellsReused << "\n";
     std::cout << "  attr cells extending table:   " << attrCellsExtended << "\n";
-    std::cout << "  hash buckets total:           " << baseline.totalBuckets << "\n";
+    std::cout << "  hash buckets total:           " << selectedSummary.totalBuckets << "\n";
     std::cout << "  object_role total:            " << objectRoleCountTotal << "\n";
     std::cout << "    role=dir:                   " << dirRoleCount << "\n";
     std::cout << "    role=filelike:              " << filelikeRoleCount << "\n";
@@ -1747,86 +1817,48 @@ int main(int argc, char** argv) {
     std::cout << "  metadata table bytes:         " << prettyBytes(objectTableBytes) << "\n";
     std::cout << "\n";
 
-    const double baselineWeightedMeanSquare = weightedMeanSquare(baseline);
-    const double baselineAvgSuccessfulLookupStrcmp = averageSuccessfulLookupStrcmp(baseline);
-    const double baselineAvgUnsuccessfulLookupStrcmp = averageUnsuccessfulLookupStrcmp(baseline);
     const double avgEmptiesPerDir =
-        directories.empty() ? 0.0 : static_cast<double>(baseline.totalEmptyBuckets) / static_cast<double>(directories.size());
-    const double baselineGlobalLoadFactor = globalLoadFactor(baseline);
+        directories.empty() ? 0.0 : static_cast<double>(selectedSummary.totalEmptyBuckets) / static_cast<double>(directories.size());
 
-    std::cout << "Directory hashing simulation\n";
+    std::cout << "Directory hashing simulation (selected policy)\n";
+    if (bestMixed != nullptr) {
+        std::cout << "  selected policy:              mixed single/double-hash\n";
+        std::cout << "  selected p2:                  " << bestMixed->p2 << "\n";
+        std::cout << "  hard directory rule:          baseline max_chain > " << options.doubleHashHardThreshold << "\n";
+        std::cout << "  hard directories switched:    " << bestMixed->result.hardDirectories
+                  << " / " << directories.size() << "\n";
+        std::cout << "  hard directories entry share: " << bestMixed->result.hardEntries
+                  << " / " << selectedSummary.totalDirEntries << "\n";
+    } else {
+        std::cout << "  selected policy:              single-hash baseline\n";
+    }
     std::cout << "  ceiling policy:              all sizes in [N, next_prime(2*N)], cap " << kMaxTablesizePrime << "\n";
     std::cout << "  directories simulated:        " << directories.size() << "\n";
-    std::cout << "  total dir entries (N sum):    " << baseline.totalDirEntries << "\n";
-    std::cout << "  total buckets:                " << baseline.totalBuckets << "\n";
-    std::cout << "  total empty buckets:          " << baseline.totalEmptyBuckets << "\n";
+    std::cout << "  total dir entries (N sum):    " << selectedSummary.totalDirEntries << "\n";
+    std::cout << "  total buckets:                " << selectedSummary.totalBuckets << "\n";
+    std::cout << "  total empty buckets:          " << selectedSummary.totalEmptyBuckets << "\n";
     std::cout << "  avg empty buckets / dir:      " << std::fixed << std::setprecision(2) << avgEmptiesPerDir << "\n";
-    std::cout << "  global load factor N/T:       " << std::fixed << std::setprecision(4) << baselineGlobalLoadFactor << "\n";
-    std::cout << "  weighted mean-square chain:   " << std::fixed << std::setprecision(4) << baselineWeightedMeanSquare << "\n";
+    std::cout << "  global load factor N/T:       " << std::fixed << std::setprecision(4) << selectedGlobalLoadFactor << "\n";
+    std::cout << "  weighted mean-square chain:   " << std::fixed << std::setprecision(4) << selectedWeightedMeanSquare << "\n";
     std::cout << "  avg strcmp per successful lookup: " << std::fixed << std::setprecision(4)
-              << baselineAvgSuccessfulLookupStrcmp << "\n";
+              << selectedAvgSuccessfulLookupStrcmp << "\n";
     std::cout << "  avg strcmp per unsuccessful lookup: " << std::fixed << std::setprecision(4)
-              << baselineAvgUnsuccessfulLookupStrcmp << "\n";
-    std::cout << "  perfect-hash dirs (score=1):  " << baseline.dirsPerfect << "\n";
-    std::cout << "  dirs hitting ceiling:         " << baseline.dirsHitCeiling << "\n";
-    std::cout << "  dirs fallback(score>=1.1):    " << baseline.dirsFallback << "\n";
-    std::cout << "  max chain observed:           " << baseline.globalMaxChain << "\n";
-    std::cout << "  dirs violating N<2^15:        " << baseline.dirsOverHardLimit << "\n";
+              << selectedAvgUnsuccessfulLookupStrcmp << "\n";
+    std::cout << "  perfect-hash dirs (score=1):  " << selectedSummary.dirsPerfect << "\n";
+    std::cout << "  dirs hitting ceiling:         " << selectedSummary.dirsHitCeiling << "\n";
+    std::cout << "  dirs fallback(score>=1.1):    " << selectedSummary.dirsFallback << "\n";
+    std::cout << "  max chain observed:           " << selectedSummary.globalMaxChain << "\n";
+    std::cout << "  dirs violating N<2^15:        " << selectedSummary.dirsOverHardLimit << "\n";
+    if (bestMixed != nullptr) {
+        std::cout << "  baseline max chain:           " << baseline.globalMaxChain << "\n";
+        std::cout << "  baseline weighted mean-square:" << std::fixed << std::setprecision(4) << baselineWeightedMeanSquare << "\n";
+        std::cout << "  baseline avg strcmp success:  " << std::fixed << std::setprecision(4) << baselineAvgSuccessfulLookupStrcmp << "\n";
+        std::cout << "  baseline avg strcmp miss:     " << std::fixed << std::setprecision(4) << baselineAvgUnsuccessfulLookupStrcmp << "\n";
+    }
     std::cout << "\n";
 
-    if (options.doubleHashExperiment) {
-        constexpr uint32_t kBigPrimeMin = (1u << 8) + 1u; // strictly greater than 2^8
-        constexpr uint32_t kBigPrimeMax = (1u << 24);     // strictly less than 2^24
-
-        const auto singleChoicesByDir = buildSingleHashChoiceByDirectoryKey(directories, dirChildren, smallPrimes);
-        const size_t sampleCount = std::max<size_t>(1, options.doubleHashSamples);
-        const auto sampledPrimes = sampleRandomPrimes(
-            kBigPrimeMin,
-            kBigPrimeMax,
-            sampleCount,
-            options.doubleHashSeed);
-
-        struct MixedTrial {
-            uint32_t p2 = 0;
-            MixedDoubleHashResult result;
-        };
-
-        std::vector<MixedTrial> trials;
-        trials.reserve(sampledPrimes.size());
-
-        for (uint32_t p2 : sampledPrimes) {
-            MixedDoubleHashResult result = simulateHashingMixedDoubleHash(
-                directories,
-                dirChildren,
-                singleChoicesByDir,
-                smallPrimes,
-                p2,
-                options.doubleHashHardThreshold);
-            trials.push_back(MixedTrial{p2, std::move(result)});
-        }
-
-        std::sort(trials.begin(), trials.end(), [](const MixedTrial& a, const MixedTrial& b) {
-            const auto& sa = a.result.summary;
-            const auto& sb = b.result.summary;
-            if (sa.globalMaxChain != sb.globalMaxChain) {
-                return sa.globalMaxChain < sb.globalMaxChain;
-            }
-            const double wa = weightedMeanSquare(sa);
-            const double wb = weightedMeanSquare(sb);
-            if (wa != wb) {
-                return wa < wb;
-            }
-            if (sa.totalBuckets != sb.totalBuckets) {
-                return sa.totalBuckets < sb.totalBuckets;
-            }
-            if (a.result.unsuccessfulTwoProbe != b.result.unsuccessfulTwoProbe) {
-                return a.result.unsuccessfulTwoProbe < b.result.unsuccessfulTwoProbe;
-            }
-            return a.p2 < b.p2;
-        });
-
-        const auto& bestMixed = trials.front();
-        const auto& bestSummary = bestMixed.result.summary;
+    if (bestMixed != nullptr) {
+        const auto& bestSummary = bestMixed->result.summary;
         const double bestWeightedMeanSquare = weightedMeanSquare(bestSummary);
         const double bestAvgSuccessfulLookupStrcmp = averageSuccessfulLookupStrcmp(bestSummary);
         const double bestGlobalLoadFactor = globalLoadFactor(bestSummary);
@@ -1834,16 +1866,16 @@ int main(int argc, char** argv) {
         const int64_t deltaMetaBytes = deltaBuckets * 16;
         const size_t topMixedN = std::min<size_t>(8, bestSummary.dirs.size());
 
-        std::cout << "Mixed single/double-hash experiment (random big-prime search)\n";
+        std::cout << "Mixed single/double-hash tuning details\n";
         std::cout << "  p1 candidates:                fixed small-prime set\n";
         std::cout << "  p2 search range:              (" << (1u << 8) << ", " << (1u << 24) << ")\n";
         std::cout << "  hard directory rule:          baseline max_chain > " << options.doubleHashHardThreshold << "\n";
-        std::cout << "  sampled random primes:        " << trials.size() << "\n";
+        std::cout << "  sampled random primes:        " << mixedTrials.size() << "\n";
         std::cout << "  RNG seed:                     " << options.doubleHashSeed << "\n";
-        std::cout << "  best p2:                      " << bestMixed.p2 << "\n";
-        std::cout << "  hard directories switched:    " << bestMixed.result.hardDirectories
+        std::cout << "  best p2:                      " << bestMixed->p2 << "\n";
+        std::cout << "  hard directories switched:    " << bestMixed->result.hardDirectories
                   << " / " << directories.size() << "\n";
-        std::cout << "  hard directories entry share: " << bestMixed.result.hardEntries
+        std::cout << "  hard directories entry share: " << bestMixed->result.hardEntries
                   << " / " << baseline.totalDirEntries << "\n";
         std::cout << "  total buckets:                " << bestSummary.totalBuckets
                   << " (delta " << std::showpos << deltaBuckets << std::noshowpos << ")\n";
@@ -1857,14 +1889,14 @@ int main(int argc, char** argv) {
         std::cout << "  avg strcmp successful:        " << std::fixed << std::setprecision(4) << bestAvgSuccessfulLookupStrcmp
                   << " (baseline " << baselineAvgSuccessfulLookupStrcmp << ")\n";
         std::cout << "  avg strcmp unsuccessful (1 probe model): " << std::fixed << std::setprecision(4)
-                  << bestMixed.result.unsuccessfulOneProbe << " (baseline " << baselineAvgUnsuccessfulLookupStrcmp << ")\n";
+                  << bestMixed->result.unsuccessfulOneProbe << " (baseline " << baselineAvgUnsuccessfulLookupStrcmp << ")\n";
         std::cout << "  avg strcmp unsuccessful (2 probe-on-hard model): " << std::fixed << std::setprecision(4)
-                  << bestMixed.result.unsuccessfulTwoProbe << "\n";
+                  << bestMixed->result.unsuccessfulTwoProbe << "\n";
 
         std::cout << "  top random-prime candidates\n";
         std::cout << "    p2 | max_chain | weighted_ms | buckets | miss_2probe_hard\n";
-        for (size_t i = 0; i < std::min<size_t>(5, trials.size()); ++i) {
-            const auto& t = trials[i];
+        for (size_t i = 0; i < std::min<size_t>(5, mixedTrials.size()); ++i) {
+            const auto& t = mixedTrials[i];
             const auto& s = t.result.summary;
             std::cout << "    " << t.p2
                       << " | " << s.globalMaxChain
@@ -1942,7 +1974,7 @@ int main(int argc, char** argv) {
     std::cout << "Worst directories by score\n";
     std::cout << "  path | N | tablesize | p | score | max_chain | empties | hit_ceiling\n";
     for (size_t i = 0; i < topN; ++i) {
-        const auto& d = baseline.dirs[i];
+        const auto& d = selectedSummary.dirs[i];
         std::cout << "  " << d.path
                   << " | " << d.n
                   << " | " << d.choice.tablesize
@@ -1957,7 +1989,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Fallback directories (hit ceiling with score >= 1.1)\n";
     std::cout << "  path | N | score\n";
-    for (const auto& d : baseline.dirs) {
+    for (const auto& d : selectedSummary.dirs) {
         if (!(d.choice.hitCeiling && d.choice.score >= 1.1)) {
             continue;
         }
