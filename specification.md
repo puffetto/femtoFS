@@ -116,11 +116,15 @@ struct femtofs_header {
     uint16_t version;        // format version
     uint16_t reserved;       // must be 0
 
+    uint32_t image_hash;     // FNV-1 32-bit hash from meta_hash to EOF (inclusive)
+    uint32_t uuid_pad;       // must be 0; aligns uuid to 128-bit boundary
+    uint32_t uuid[4];        // random image UUID (128-bit)
+    uint32_t meta_hash;      // FNV-1 32-bit hash over metadata table
+
     uint32_t cell_count;     // number of entries in metadata table
     uint32_t public_off;     // content-region start (public part, page-aligned)
     uint32_t private_off;    // split point: private-part start (page-aligned)
     uint32_t meta_size;      // metadata table size in bytes
-    uint32_t meta_hash;      // FNV-1 32-bit hash over metadata table
 
     uint32_t root_first;     // root bucket slice start index in metadata table
     uint32_t root_size;      // root tablesize
@@ -130,7 +134,7 @@ struct femtofs_header {
     uint8_t  root_pad;       // must be 0
     uint32_t hash2_base;     // global second-hash base prime for dual-hash mode
 
-    uint8_t  author[80];     // NUL-terminated, zero-padded
+    uint8_t  author[56];     // 'Andrea "Nemesi" Cocito - blackye at gmail dot com\0', zero-padded
 };                           // exactly 128 bytes
 ```
 
@@ -146,7 +150,10 @@ Notes:
   `off < private_off` is public, `off >= private_off` is private.
 - Split-content layout changes the on-disk header and therefore requires a
   format `version` bump relative to the single-part layout.
-- `meta_hash` is a non-cryptographic integrity/sanity check.
+- `meta_hash` is a non-cryptographic metadata-table integrity/sanity check.
+- `image_hash` is a non-cryptographic whole-image integrity/sanity check.
+- `uuid` is a random per-image 128-bit identifier.
+- `uuid_pad` is reserved alignment padding and must be `0`.
 - Root descriptor is in header because root has no parent bucket entry.
 - `root_p` uses the same hash-control encoding as directory `hash_p` fields.
 - `hash2_base` is used only when at least one directory (including root) is in
@@ -169,8 +176,36 @@ Builder rule:
   `meta_hash = fnv_32_buf(meta_bytes, meta_size, FNV1_32_INIT)`.
 
 Reader rule:
-- Before trusting metadata-table contents, recompute the same hash and require
-  exact equality with header `meta_hash`; mismatch means corrupt/invalid image.
+- Before trusting metadata-table contents, implementations SHOULD recompute the
+  same hash and require exact equality with header `meta_hash`; mismatch means
+  corrupt/invalid image.
+
+### Whole-Image Integrity Hash (`image_hash`)
+
+`image_hash` is deterministic and algorithm-fixed:
+- Hash function: FreeBSD kernel `fnv_32_buf()` from `<sys/fnv_hash.h>`
+  (FNV-1, 32-bit state).
+- Initial value: `FNV1_32_INIT`.
+- Input bytes: exact byte range from `meta_hash` (inclusive) to the
+  end of image (`image_size`), i.e. in this layout:
+  `image[offsetof(struct femtofs_header, meta_hash) .. image_size)`.
+- `image_hash` and `uuid[]` bytes are not part of the hash input.
+- No salt/nonce/secret key is used.
+
+Builder rule:
+- After finalizing all bytes from `meta_hash` through the end of image,
+  compute:
+  `image_hash = fnv_32_buf(image + offsetof(struct femtofs_header, meta_hash), image_size - offsetof(struct femtofs_header, meta_hash), FNV1_32_INIT)`.
+
+Reader rule:
+- Implementations MAY verify `image_hash` at mount/open time.
+
+### Same-Image Identity
+
+When determining whether two mounted/opened images are "the same image",
+implementations SHOULD require exact equality for all header fields from byte 0
+through the end of `uuid[3]` (that is: `magic`, `version`, `reserved`,
+`image_hash`, `uuid_pad`, and all four words of `uuid[0..3]`).
 
 Offset model:
 - Every on-disk 32-bit pointer to content bytes is image-relative.
@@ -907,14 +942,17 @@ Content region split:
 
 ## Normative Validation Rules (Builder/Reader/Kernel)
 
-This section defines mandatory checks for deterministic interoperability and
-safe mounting.
+This section defines normative (`MUST`/`SHOULD`/`MAY`) checks for deterministic
+interoperability and safe mounting.
 
 Header and top-level bounds:
-- `magic` must be exactly `{'0','F','S','\0'}`.
-- `version` must be supported by the reader; unsupported versions must be
-  rejected.
-- `reserved == 0` and `root_pad == 0`.
+- Implementations MUST check `magic`, `version`, and `reserved`:
+  - `magic` must be exactly `{'0','F','S','\0'}`.
+  - `version` must be supported by the reader; unsupported versions must be
+    rejected.
+  - `reserved == 0`.
+- `root_pad == 0`.
+- `uuid_pad == 0`.
 - `meta_size == cell_count * 16`.
 - `cell_count > 0`.
 - `128 + meta_size <= public_off <= private_off <= image_size`.
@@ -926,8 +964,12 @@ Header and top-level bounds:
 - Root hash control (`root_p`) must decode to:
   - mode in `{FEMTOFS_HASH_MODE_SINGLE, FEMTOFS_HASH_MODE_DUAL}`
   - `p1_index < SMALL_PRIMES_COUNT`.
-- `meta_hash` must exactly match
-  `fnv_32_buf(image + 128, meta_size, FNV1_32_INIT)`.
+- Implementations SHOULD check `meta_hash` to ensure metadata-table integrity:
+  `meta_hash == fnv_32_buf(image + 128, meta_size, FNV1_32_INIT)`.
+- Implementations MAY check `image_hash` at mount/open time:
+  `image_hash == fnv_32_buf(image + offsetof(struct femtofs_header, meta_hash), image_size - offsetof(struct femtofs_header, meta_hash), FNV1_32_INIT)`.
+- To decide whether two images are "the same image", implementations SHOULD
+  check exact equality on all header fields up to and including `uuid[0..3]`.
 
 Cell typing and reserved-bit rules:
 - Valid `type` values in this version are:

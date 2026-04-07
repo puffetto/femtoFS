@@ -118,6 +118,10 @@ like a deployable artifact instead of a tiny database.
   future ACL/xattr payloads in private-part content
 - Metadata-table integrity check is deterministic FreeBSD kernel FNV-1
   (`fnv_32_buf`, `FNV1_32_INIT`) over metadata bytes
+- Optional whole-image integrity check uses deterministic FreeBSD kernel FNV-1
+  over bytes from `meta_hash` (inclusive) to end-of-image, with a random
+  128-bit `uuid`
+  in the header for same-image identity checks
 
 The result is a format that is easy to generate, cheap to mount, and pleasant
 to reason about under a debugger.
