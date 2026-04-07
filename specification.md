@@ -559,6 +559,13 @@ uint32_t femtofs_hash(const char *name, uint8_t p, uint32_t tablesize) {
 }
 ```
 
+Implementation note (performance, non-normative):
+- Because filename blobs are 4-byte aligned and zero-padded, implementations
+  SHOULD use word-wise scanning in hot paths (hash and compare), then resolve
+  the terminal word byte-by-byte to stop exactly at the first `0x00`.
+- This is an optimization only; externally visible behavior must match the
+  byte-wise reference function above.
+
 ### Lookup Algorithm
 
 ```c
@@ -773,8 +780,17 @@ Consequences:
 - If `announced_bytes % 4 == 0`, the suffix is one full zero word.
 - Otherwise the suffix is `1..3` zero bytes that simultaneously terminate and
   align.
+- Therefore, for every stored blob, the 4th byte of its terminal 4-byte word
+  is always `0x00`.
 - Object-reported size remains the original announced size (`size` for file
   objects); suffix bytes are never part of object-visible length.
+
+Implementation note (performance, non-normative):
+- Kernel code MAY scan filename blobs as a sequence of 32-bit words and treat a
+  word whose 4th byte is `0x00` as the terminal word.
+- Hashing and string-compare semantics remain byte-accurate C-string semantics:
+  stop at the first `0x00` byte, and do not include alignment-padding bytes in
+  hash input.
 
 ### Packing Algorithm (Per Content Part)
 
