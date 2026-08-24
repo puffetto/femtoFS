@@ -1,27 +1,31 @@
+// File: programs/femtofsSim.cpp
+// Created by Andrea "Nemesi" Cocito on 24/08/2026
+// Estimate femtoFS 0x0100 metadata, hashing, packing, and mmap behavior.
+
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
-#include <random>
 #include <regex>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include <isPrime.h>
+#include <femtofs/format.h>
+#include <femtofs/hash_plan.h>
 
 namespace {
 
-constexpr uint32_t kMaxTablesizePrime = 65521u;
-constexpr uint32_t kDirEntryHardLimit = 1u << 15; // N < 2^15
 constexpr uint32_t kBlobWord = 4u;
 
 struct FsEntry {
@@ -87,14 +91,15 @@ struct HashSimulationSummary {
 
 struct ProgramOptions {
     std::string inputPath = "misc/list";
-    uint32_t pageSize = 4096u;
+    uint32_t imagePageSize = femtofs::kPageSize;
+    uint32_t vmPageSize = femtofs::kPageSize;
     bool fixedBaseExperiment = false;
     size_t fixedBaseSamples = 100;
     uint32_t fixedBaseSeed = 0x0F5F2026u;
-    bool doubleHashExperiment = true;
-    size_t doubleHashSamples = 100;
-    uint32_t doubleHashSeed = 0x0F5F2026u;
-    uint32_t doubleHashHardThreshold = 2u;
+    bool dualHashExperiment = true;
+    size_t dualHashSamples = 100;
+    uint32_t dualHashSeed = 0x0F5F2026u;
+    uint32_t dualHashHardThreshold = 2u;
     bool budgetedHashExperiment = true;
     uint32_t budgetedTargetMaxChain = 2u;
     std::vector<uint32_t> budgetedBudgetsKiB = {0u, 64u, 128u, 256u, 512u};
@@ -114,7 +119,7 @@ struct BudgetedHashTuningResult {
     uint64_t directoriesChanged = 0;
 };
 
-struct MixedDoubleHashResult {
+struct MixedDualHashResult {
     HashSimulationSummary summary;
     uint64_t hardDirectories = 0;
     uint64_t hardEntries = 0;
@@ -181,162 +186,49 @@ bool parseFindLsLine(const std::string& line, FsEntry& out) {
 }
 
 const std::vector<uint32_t>& fixedSmallPrimes() {
-    static const std::vector<uint32_t> kSmallPrimes = {
-        3u,   5u,   7u,   11u,  13u,  17u,  19u,  23u,  29u,  31u,  37u,  41u,  43u,  47u,
-        53u,  59u,  61u,  67u,  71u,  73u,  79u,  83u,  89u,  97u,  101u, 103u, 107u,
-        109u, 113u, 127u, 131u, 137u, 139u, 149u, 151u, 157u, 163u, 167u,
-        173u, 179u, 181u, 191u, 193u, 197u, 199u, 211u, 223u, 227u, 229u,
-        233u, 239u, 241u, 251u
-    };
+    static const std::vector<uint32_t> kSmallPrimes(
+        femtofs::kSmallPrimes.begin(), femtofs::kSmallPrimes.end());
     return kSmallPrimes;
 }
 
-uint32_t nextPrimeAtLeast(uint32_t n) {
-    if (n <= 2u) {
-        return 2u;
-    }
-    uint32_t candidate = (n % 2u == 0u) ? (n + 1u) : n;
-    for (;; candidate += 2u) {
-        if (utilities::isPrime(candidate)) {
-            return candidate;
-        }
-    }
+uint32_t smallPrimeIndex(uint32_t prime) {
+    const auto found = std::find(femtofs::kSmallPrimes.begin(),
+                                 femtofs::kSmallPrimes.end(), prime);
+    if (found == femtofs::kSmallPrimes.end())
+        return UINT32_MAX;
+    return static_cast<uint32_t>(
+        std::distance(femtofs::kSmallPrimes.begin(), found));
 }
 
 uint32_t nextPrimeStrictlyGreater(uint32_t n) {
-    if (n < 2u) {
-        return 2u;
-    }
-    uint32_t candidate = n + 1u;
-    if (candidate <= 2u) {
-        return 2u;
-    }
-    if (candidate % 2u == 0u) {
-        ++candidate;
-    }
-    for (;; candidate += 2u) {
-        if (utilities::isPrime(candidate)) {
-            return candidate;
-        }
-    }
+    return femtofs::hashplan::nextPrimeStrict(n);
 }
 
-uint32_t femtofsHash(const std::string& name, uint32_t p, uint32_t tablesize) {
-    if (tablesize <= 1) {
-        return 0;
-    }
-    uint32_t h = 0;
-    for (unsigned char c : name) {
-        h = h * static_cast<uint32_t>(p) + static_cast<uint32_t>(c);
-    }
-    return h % tablesize;
-}
-
-struct Score {
-    uint64_t sumSquares = 0;
-    uint32_t maxChain = 0;
-};
+using Score = femtofs::hashplan::Score;
 
 Score scoreDirectory(const std::vector<std::string>& names, uint32_t p, uint32_t tablesize) {
-    std::vector<uint32_t> buckets(tablesize, 0);
-    for (const auto& name : names) {
-        ++buckets[femtofsHash(name, p, tablesize)];
-    }
-    Score s;
-    for (uint32_t c : buckets) {
-        if (c == 0) {
-            continue;
-        }
-        s.sumSquares += static_cast<uint64_t>(c) * static_cast<uint64_t>(c);
-        s.maxChain = std::max(s.maxChain, c);
-    }
-    return s;
+    return femtofs::hashplan::scoreSingle(names, p, tablesize);
 }
 
-HashChoice chooseHash(const std::vector<std::string>& names, const std::vector<uint32_t>& bases) {
+HashChoice simulationChoice(const femtofs::hashplan::Choice& choice,
+                            uint32_t entries) {
     HashChoice out;
-    const uint32_t n = static_cast<uint32_t>(names.size());
+    out.tablesize = choice.tableSize;
+    out.p = choice.prime;
+    out.score = entries == 0 ? 0.0 :
+        static_cast<double>(choice.sumSquares) / static_cast<double>(entries);
+    out.maxChain = choice.maxChain;
+    out.sumSquares = choice.sumSquares;
+    out.empties = choice.tableSize - entries;
+    out.hitCeiling = choice.hitCeiling;
+    out.ceiling = choice.ceiling;
+    return out;
+}
 
-    if (n == 0) {
-        out.tablesize = 0;
-        out.p = 0;
-        out.score = 0.0;
-        out.maxChain = 0;
-        out.sumSquares = 0;
-        out.empties = 0;
-        out.ceiling = 0;
-        return out;
-    }
-    if (n == 1) {
-        out.tablesize = 1;
-        out.p = 0;
-        out.score = 1.0;
-        out.maxChain = 1;
-        out.sumSquares = 1;
-        out.empties = 0;
-        out.ceiling = 1;
-        return out;
-    }
-
-    uint32_t tablesize = n; // phase 1: fully packed
-    const uint32_t target = nextPrimeAtLeast(2u * n);
-    const uint32_t ceiling = std::min(target, kMaxTablesizePrime);
-
-    double bestScore = std::numeric_limits<double>::infinity();
-    uint32_t bestP = 0;
-    uint32_t bestSize = n;
-    uint32_t bestMaxChain = 0;
-    uint64_t bestSumSquares = 0;
-
-    for (;;) {
-        for (uint32_t p : bases) {
-            const Score s = scoreDirectory(names, p, tablesize);
-            const double score = static_cast<double>(s.sumSquares) / static_cast<double>(n);
-
-            if (s.sumSquares == n) {
-                out.tablesize = tablesize;
-                out.p = p;
-                out.score = 1.0;
-                out.maxChain = s.maxChain;
-                out.sumSquares = s.sumSquares;
-                out.empties = tablesize - n;
-                out.ceiling = ceiling;
-                return out;
-            }
-            if (score < bestScore) {
-                bestScore = score;
-                bestP = p;
-                bestSize = tablesize;
-                bestMaxChain = s.maxChain;
-                bestSumSquares = s.sumSquares;
-            }
-        }
-
-        if (bestScore < 1.1) {
-            out.tablesize = bestSize;
-            out.p = bestP;
-            out.score = bestScore;
-            out.maxChain = bestMaxChain;
-            out.sumSquares = bestSumSquares;
-            out.empties = bestSize - n;
-            out.ceiling = ceiling;
-            return out;
-        }
-
-        const uint32_t next = nextPrimeStrictlyGreater(tablesize);
-        if (next > ceiling) {
-            out.tablesize = bestSize;
-            out.p = bestP;
-            out.score = bestScore;
-            out.maxChain = bestMaxChain;
-            out.sumSquares = bestSumSquares;
-            out.empties = bestSize - n;
-            out.ceiling = ceiling;
-            out.hitCeiling = true;
-            return out;
-        }
-        tablesize = next;
-    }
+HashChoice chooseHash(const std::vector<std::string>& names,
+                      const std::vector<uint32_t>& bases) {
+    return simulationChoice(femtofs::hashplan::chooseSingle(names, bases),
+                            static_cast<uint32_t>(names.size()));
 }
 
 HashChoice chooseHashWithFixedFallback(const std::vector<std::string>& names,
@@ -373,7 +265,7 @@ std::vector<uint32_t> parseU32Csv(const std::string& csv) {
 ProgramOptions parseArgs(int argc, char** argv) {
     ProgramOptions opts;
     bool inputSet = false;
-    bool pageSizeSet = false;
+    bool imagePageSizeSet = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -391,27 +283,39 @@ ProgramOptions parseArgs(int argc, char** argv) {
             opts.fixedBaseSeed = static_cast<uint32_t>(std::stoul(arg.substr(18)));
             continue;
         }
-        if (arg == "--double-hash-experiment") {
-            opts.doubleHashExperiment = true;
+        if (arg == "--dual-hash-experiment") {
+            opts.dualHashExperiment = true;
             continue;
         }
-        if (arg == "--no-double-hash-experiment") {
-            opts.doubleHashExperiment = false;
+        if (arg == "--no-dual-hash-experiment") {
+            opts.dualHashExperiment = false;
             continue;
         }
-        if (arg.rfind("--double-hash-samples=", 0) == 0) {
-            opts.doubleHashExperiment = true;
-            opts.doubleHashSamples = static_cast<size_t>(std::stoul(arg.substr(22)));
+        constexpr std::string_view dualSamples = "--dual-hash-samples=";
+        if (arg.rfind(dualSamples, 0) == 0) {
+            opts.dualHashExperiment = true;
+            opts.dualHashSamples = static_cast<size_t>(
+                std::stoul(arg.substr(dualSamples.size())));
             continue;
         }
-        if (arg.rfind("--double-hash-seed=", 0) == 0) {
-            opts.doubleHashExperiment = true;
-            opts.doubleHashSeed = static_cast<uint32_t>(std::stoul(arg.substr(19)));
+        constexpr std::string_view dualSeed = "--dual-hash-seed=";
+        if (arg.rfind(dualSeed, 0) == 0) {
+            opts.dualHashExperiment = true;
+            opts.dualHashSeed = static_cast<uint32_t>(
+                std::stoul(arg.substr(dualSeed.size())));
             continue;
         }
-        if (arg.rfind("--double-hash-hard-threshold=", 0) == 0) {
-            opts.doubleHashExperiment = true;
-            opts.doubleHashHardThreshold = static_cast<uint32_t>(std::stoul(arg.substr(29)));
+        constexpr std::string_view dualThreshold = "--dual-hash-hard-threshold=";
+        if (arg.rfind(dualThreshold, 0) == 0) {
+            opts.dualHashExperiment = true;
+            opts.dualHashHardThreshold = static_cast<uint32_t>(
+                std::stoul(arg.substr(dualThreshold.size())));
+            continue;
+        }
+        constexpr std::string_view vmPage = "--vm-page-size=";
+        if (arg.rfind(vmPage, 0) == 0) {
+            opts.vmPageSize = static_cast<uint32_t>(
+                std::stoul(arg.substr(vmPage.size())));
             continue;
         }
         if (arg == "--budgeted-hash-experiment") {
@@ -437,19 +341,29 @@ ProgramOptions parseArgs(int argc, char** argv) {
             inputSet = true;
             continue;
         }
-        if (!pageSizeSet) {
-            opts.pageSize = static_cast<uint32_t>(std::stoul(arg));
-            pageSizeSet = true;
+        if (!imagePageSizeSet) {
+            opts.imagePageSize = static_cast<uint32_t>(std::stoul(arg));
+            imagePageSizeSet = true;
             continue;
         }
-        throw std::runtime_error("usage: femtofsSim [inputPath] [pageSize] [--fixed-base-experiment] "
+        throw std::runtime_error("usage: femtofsSim [inputPath] [imagePageSize] [--vm-page-size=N] "
+                                 "[--fixed-base-experiment] "
                                  "[--fixed-base-samples=N] [--fixed-base-seed=N] "
-                                 "[--double-hash-experiment|--no-double-hash-experiment] "
-                                 "[--double-hash-samples=N] [--double-hash-seed=N] "
-                                 "[--double-hash-hard-threshold=N] "
+                                 "[--dual-hash-experiment|--no-dual-hash-experiment] "
+                                 "[--dual-hash-samples=N] [--dual-hash-seed=N] "
+                                 "[--dual-hash-hard-threshold=N] "
                                  "[--budgeted-hash-experiment|--no-budgeted-hash-experiment] "
                                  "[--budgeted-budgets-kib=a,b,c] [--budgeted-target-max-chain=N]");
     }
+
+    const auto validPageSize = [](uint32_t value) {
+        return value >= 256u && value <= (1u << 31) &&
+               (value & (value - 1u)) == 0;
+    };
+    if (!validPageSize(opts.imagePageSize))
+        throw std::runtime_error("image PAGE_SIZE must be a power of two from 256 through 2^31");
+    if (!validPageSize(opts.vmPageSize))
+        throw std::runtime_error("VM_PAGE_SIZE must be a power of two from 256 through 2^31");
 
     return opts;
 }
@@ -458,34 +372,8 @@ std::vector<uint32_t> sampleRandomPrimes(uint32_t minInclusive,
                                          uint32_t maxExclusive,
                                          size_t count,
                                          uint32_t seed) {
-    std::vector<uint32_t> primes;
-    if (minInclusive >= maxExclusive || count == 0) {
-        return primes;
-    }
-
-    std::mt19937 rng(seed);
-    std::uniform_int_distribution<uint32_t> dist(minInclusive, maxExclusive - 1);
-    std::unordered_set<uint32_t> seen;
-    seen.reserve(count * 2);
-
-    while (primes.size() < count) {
-        uint32_t candidate = dist(rng);
-        candidate |= 1u;
-        if (candidate >= maxExclusive) {
-            candidate -= 2u;
-        }
-        if (candidate < minInclusive) {
-            candidate = minInclusive | 1u;
-        }
-        if (!utilities::isPrime(candidate)) {
-            continue;
-        }
-        if (seen.insert(candidate).second) {
-            primes.push_back(candidate);
-        }
-    }
-
-    return primes;
+    return femtofs::hashplan::samplePrimes(
+        minInclusive, maxExclusive, count, seed);
 }
 
 HashSimulationSummary simulateHashing(const std::set<std::string>& directories,
@@ -497,7 +385,7 @@ HashSimulationSummary simulateHashing(const std::set<std::string>& directories,
     for (const auto& d : directories) {
         const auto& names = dirChildren.at(d);
         const uint32_t n = static_cast<uint32_t>(names.size());
-        if (n >= kDirEntryHardLimit) {
+        if (n >= femtofs::kMaxDirectoryEntries) {
             ++summary.dirsOverHardLimit;
         }
 
@@ -545,7 +433,7 @@ HashSimulationSummary simulateHashingWithFixedFallback(
     for (const auto& d : directories) {
         const auto& names = dirChildren.at(d);
         const uint32_t n = static_cast<uint32_t>(names.size());
-        if (n >= kDirEntryHardLimit) {
+        if (n >= femtofs::kMaxDirectoryEntries) {
             ++summary.dirsOverHardLimit;
         }
 
@@ -582,158 +470,11 @@ HashSimulationSummary simulateHashingWithFixedFallback(
     return summary;
 }
 
-Score scoreDirectoryTwoChoiceBalanced(const std::vector<std::string>& names,
-                                      uint32_t p1,
-                                      uint32_t p2,
-                                      uint32_t tablesize) {
-    std::vector<uint32_t> buckets(tablesize, 0);
-    for (const auto& name : names) {
-        const uint32_t i1 = femtofsHash(name, p1, tablesize);
-        const uint32_t i2 = femtofsHash(name, p2, tablesize);
-        uint32_t chosen = i1;
-        if (buckets[i2] < buckets[i1] || (buckets[i2] == buckets[i1] && i2 < i1)) {
-            chosen = i2;
-        }
-        ++buckets[chosen];
-    }
-    Score s;
-    for (uint32_t c : buckets) {
-        if (c == 0) {
-            continue;
-        }
-        s.sumSquares += static_cast<uint64_t>(c) * static_cast<uint64_t>(c);
-        s.maxChain = std::max(s.maxChain, c);
-    }
-    return s;
-}
-
 HashChoice chooseHashTwoChoiceBalanced(const std::vector<std::string>& names,
                                        const std::vector<uint32_t>& bases,
                                        uint32_t p2) {
-    HashChoice out;
-    const uint32_t n = static_cast<uint32_t>(names.size());
-
-    if (n == 0) {
-        out.tablesize = 0;
-        out.p = 0;
-        out.score = 0.0;
-        out.maxChain = 0;
-        out.sumSquares = 0;
-        out.empties = 0;
-        out.ceiling = 0;
-        return out;
-    }
-    if (n == 1) {
-        out.tablesize = 1;
-        out.p = 0;
-        out.score = 1.0;
-        out.maxChain = 1;
-        out.sumSquares = 1;
-        out.empties = 0;
-        out.ceiling = 1;
-        return out;
-    }
-
-    const uint32_t target = nextPrimeAtLeast(2u * n);
-    const uint32_t ceiling = std::min(target, kMaxTablesizePrime);
-
-    bool hasBest = false;
-    uint32_t bestP = 0;
-    uint32_t bestSize = n;
-    uint32_t bestMaxChain = std::numeric_limits<uint32_t>::max();
-    uint64_t bestSumSquares = std::numeric_limits<uint64_t>::max();
-
-    auto consider = [&](uint32_t p1, uint32_t tablesize, const Score& s) {
-        const bool take =
-            !hasBest ||
-            s.maxChain < bestMaxChain ||
-            (s.maxChain == bestMaxChain && s.sumSquares < bestSumSquares) ||
-            (s.maxChain == bestMaxChain && s.sumSquares == bestSumSquares && tablesize < bestSize) ||
-            (s.maxChain == bestMaxChain && s.sumSquares == bestSumSquares && tablesize == bestSize && p1 < bestP);
-        if (!take) {
-            return;
-        }
-        hasBest = true;
-        bestP = p1;
-        bestSize = tablesize;
-        bestMaxChain = s.maxChain;
-        bestSumSquares = s.sumSquares;
-    };
-
-    uint32_t tablesize = n;
-    for (;;) {
-        for (uint32_t p1 : bases) {
-            const Score s = scoreDirectoryTwoChoiceBalanced(names, p1, p2, tablesize);
-            consider(p1, tablesize, s);
-        }
-
-        if (bestMaxChain <= 1) {
-            break;
-        }
-        const uint32_t next = nextPrimeStrictlyGreater(tablesize);
-        if (next > ceiling) {
-            break;
-        }
-        tablesize = next;
-    }
-
-    out.tablesize = bestSize;
-    out.p = bestP;
-    out.score = static_cast<double>(bestSumSquares) / static_cast<double>(n);
-    out.maxChain = bestMaxChain;
-    out.sumSquares = bestSumSquares;
-    out.empties = bestSize - n;
-    out.ceiling = ceiling;
-    out.hitCeiling = (bestSize == ceiling && out.score >= 1.1);
-    return out;
-}
-
-HashSimulationSummary simulateHashingTwoChoiceBalanced(
-    const std::set<std::string>& directories,
-    const std::unordered_map<std::string, std::vector<std::string>>& dirChildren,
-    const std::vector<uint32_t>& bases,
-    uint32_t p2) {
-    HashSimulationSummary summary;
-    summary.dirs.reserve(directories.size());
-
-    for (const auto& d : directories) {
-        const auto& names = dirChildren.at(d);
-        const uint32_t n = static_cast<uint32_t>(names.size());
-        if (n >= kDirEntryHardLimit) {
-            ++summary.dirsOverHardLimit;
-        }
-
-        HashChoice hc = chooseHashTwoChoiceBalanced(names, bases, p2);
-        if (hc.score == 1.0 && n > 0) {
-            ++summary.dirsPerfect;
-        }
-        if (hc.hitCeiling) {
-            ++summary.dirsHitCeiling;
-            if (hc.score >= 1.1) {
-                ++summary.dirsFallback;
-            }
-        }
-
-        summary.totalDirEntries += n;
-        summary.totalBuckets += hc.tablesize;
-        summary.totalEmptyBuckets += hc.empties;
-        summary.totalSumSquares += hc.sumSquares;
-        summary.globalMaxChain = std::max(summary.globalMaxChain, hc.maxChain);
-
-        summary.dirs.push_back(DirReport{d.empty() ? "/" : d, n, hc});
-    }
-
-    std::sort(summary.dirs.begin(), summary.dirs.end(), [](const DirReport& a, const DirReport& b) {
-        if (a.choice.maxChain != b.choice.maxChain) {
-            return a.choice.maxChain > b.choice.maxChain;
-        }
-        if (a.choice.score != b.choice.score) {
-            return a.choice.score > b.choice.score;
-        }
-        return a.n > b.n;
-    });
-
-    return summary;
+    return simulationChoice(femtofs::hashplan::chooseDual(names, bases, p2),
+                            static_cast<uint32_t>(names.size()));
 }
 
 std::unordered_map<std::string, HashChoice> buildSingleHashChoiceByDirectoryKey(
@@ -749,14 +490,14 @@ std::unordered_map<std::string, HashChoice> buildSingleHashChoiceByDirectoryKey(
     return byDir;
 }
 
-MixedDoubleHashResult simulateHashingMixedDoubleHash(
+MixedDualHashResult simulateHashingMixedDualHash(
     const std::set<std::string>& directories,
     const std::unordered_map<std::string, std::vector<std::string>>& dirChildren,
     const std::unordered_map<std::string, HashChoice>& singleChoicesByDir,
     const std::vector<uint32_t>& bases,
     uint32_t p2,
     uint32_t hardThreshold) {
-    MixedDoubleHashResult out;
+    MixedDualHashResult out;
     out.summary.dirs.reserve(directories.size());
 
     long double weightedOne = 0.0L;
@@ -765,7 +506,7 @@ MixedDoubleHashResult simulateHashingMixedDoubleHash(
     for (const auto& d : directories) {
         const auto& names = dirChildren.at(d);
         const uint32_t n = static_cast<uint32_t>(names.size());
-        if (n >= kDirEntryHardLimit) {
+        if (n >= femtofs::kMaxDirectoryEntries) {
             ++out.summary.dirsOverHardLimit;
         }
 
@@ -776,9 +517,14 @@ MixedDoubleHashResult simulateHashingMixedDoubleHash(
 
         const HashChoice single = singleIt->second;
         const bool isHard = (single.maxChain > hardThreshold);
-        const HashChoice hc = isHard ? chooseHashTwoChoiceBalanced(names, bases, p2) : single;
+        const HashChoice dual = isHard ?
+            chooseHashTwoChoiceBalanced(names, bases, p2) : single;
+        const bool useDual = isHard && femtofs::hashplan::improvesQuality(
+            Score{dual.sumSquares, dual.maxChain},
+            Score{single.sumSquares, single.maxChain});
+        const HashChoice& hc = useDual ? dual : single;
 
-        if (isHard) {
+        if (useDual) {
             ++out.hardDirectories;
             out.hardEntries += n;
         }
@@ -805,7 +551,7 @@ MixedDoubleHashResult simulateHashingMixedDoubleHash(
             const long double tl = static_cast<long double>(hc.tablesize);
             const long double unit = (nl * nl) / tl;
             weightedOne += unit;
-            weightedTwo += isHard ? (2.0L * unit) : unit;
+            weightedTwo += useDual ? (2.0L * unit) : unit;
         }
     }
 
@@ -884,6 +630,39 @@ HashChoice chooseBestForFixedTableSize(const std::vector<std::string>& names,
     return out;
 }
 
+HashSimulationSummary simulateMinimumHashing(
+    const std::set<std::string>& directories,
+    const std::unordered_map<std::string, std::vector<std::string>>& dirChildren,
+    const std::vector<uint32_t>& bases) {
+    HashSimulationSummary summary;
+    summary.dirs.reserve(directories.size());
+    for (const auto& directory : directories) {
+        const auto& names = dirChildren.at(directory);
+        const uint32_t n = static_cast<uint32_t>(names.size());
+        const HashChoice choice = chooseBestForFixedTableSize(
+            names, bases, n, n);
+        summary.totalDirEntries += n;
+        summary.totalBuckets += choice.tablesize;
+        summary.totalEmptyBuckets += choice.empties;
+        summary.totalSumSquares += choice.sumSquares;
+        summary.globalMaxChain = std::max(summary.globalMaxChain,
+                                          choice.maxChain);
+        summary.dirsPerfect += choice.score == 1.0 && n > 0;
+        summary.dirsOverHardLimit += n >= femtofs::kMaxDirectoryEntries;
+        summary.dirs.push_back(DirReport{
+            directory.empty() ? "/" : directory, n, choice});
+    }
+    std::sort(summary.dirs.begin(), summary.dirs.end(),
+        [](const DirReport& lhs, const DirReport& rhs) {
+            if (lhs.choice.score != rhs.choice.score)
+                return lhs.choice.score > rhs.choice.score;
+            if (lhs.choice.maxChain != rhs.choice.maxChain)
+                return lhs.choice.maxChain > rhs.choice.maxChain;
+            return lhs.n > rhs.n;
+        });
+    return summary;
+}
+
 bool sameHashChoiceKey(const HashChoice& a, const HashChoice& b) {
     return a.tablesize == b.tablesize &&
            a.p == b.p &&
@@ -960,7 +739,7 @@ HashSimulationSummary summarizeHashChoices(const std::vector<DirectoryHashCandid
         const auto& hc = set.choices[selectedChoiceIndices[i]];
         const uint32_t n = set.n;
 
-        if (n >= kDirEntryHardLimit) {
+        if (n >= femtofs::kMaxDirectoryEntries) {
             ++summary.dirsOverHardLimit;
         }
         if (hc.score == 1.0 && n > 0) {
@@ -1195,9 +974,9 @@ void addHole(std::multimap<uint32_t, uint64_t>& holes, uint64_t off, uint32_t si
     holes.emplace(size, off);
 }
 
-PackingStats packContents(std::vector<uint32_t> sizes, uint32_t pageSize) {
+PackingStats packContents(std::vector<uint32_t> sizes, uint32_t imagePageSize) {
     PackingStats ps;
-    if (pageSize == 0) {
+    if (imagePageSize == 0) {
         return ps;
     }
 
@@ -1224,9 +1003,11 @@ PackingStats packContents(std::vector<uint32_t> sizes, uint32_t pageSize) {
             continue;
         }
 
-        const uint32_t pageOff = static_cast<uint32_t>(tail % pageSize);
-        if (pageOff + s > pageSize) {
-            const uint32_t gap = pageSize - pageOff;
+        const uint32_t pageOff = static_cast<uint32_t>(tail % imagePageSize);
+        const bool needsAlignment = s >= imagePageSize ? pageOff != 0 :
+            static_cast<uint64_t>(pageOff) + s > imagePageSize;
+        if (needsAlignment) {
+            const uint32_t gap = imagePageSize - pageOff;
             addHole(holes, tail, gap);
             tail += gap;
         }
@@ -1239,7 +1020,7 @@ PackingStats packContents(std::vector<uint32_t> sizes, uint32_t pageSize) {
 }
 
 PackingStats packClassifiedContents(const std::vector<ClassifiedContent>& contents,
-                                    uint32_t pageSize,
+                                    uint32_t imagePageSize,
                                     bool targetPublicPool) {
     std::vector<uint32_t> sizes;
     sizes.reserve(contents.size());
@@ -1248,14 +1029,14 @@ PackingStats packClassifiedContents(const std::vector<ClassifiedContent>& conten
             sizes.push_back(content.size);
         }
     }
-    return packContents(std::move(sizes), pageSize);
+    return packContents(std::move(sizes), imagePageSize);
 }
 
 VisibilitySplitPackingStats packContentsWithVisibilitySplit(const std::vector<ClassifiedContent>& contents,
-                                                            uint32_t pageSize) {
+                                                            uint32_t imagePageSize) {
     VisibilitySplitPackingStats stats;
-    stats.publicPool = packClassifiedContents(contents, pageSize, true);
-    stats.privatePool = packClassifiedContents(contents, pageSize, false);
+    stats.publicPool = packClassifiedContents(contents, imagePageSize, true);
+    stats.privatePool = packClassifiedContents(contents, imagePageSize, false);
     stats.combined.rawBytes = stats.publicPool.rawBytes + stats.privatePool.rawBytes;
     stats.combined.paddedBytes = stats.publicPool.paddedBytes + stats.privatePool.paddedBytes;
     stats.combined.paddingBytes = stats.publicPool.paddingBytes + stats.privatePool.paddingBytes;
@@ -1276,12 +1057,24 @@ std::string prettyBytes(uint64_t bytes) {
     return oss.str();
 }
 
-uint32_t alignUp(uint32_t x, uint32_t a) {
+uint64_t alignUp(uint64_t x, uint32_t a) {
     if (a == 0) {
         return x;
     }
-    const uint32_t r = x % a;
-    return r == 0 ? x : (x + (a - r));
+    const uint64_t remainder = x % a;
+    if (remainder == 0)
+        return x;
+    const uint64_t increment = a - remainder;
+    if (x > std::numeric_limits<uint64_t>::max() - increment)
+        throw std::runtime_error("alignment overflow");
+    return x + increment;
+}
+
+uint32_t pageFormatCode(uint32_t pageSize) {
+    uint32_t code = 0;
+    for (uint32_t value = 256u; value < pageSize; value <<= 1u)
+        ++code;
+    return code;
 }
 
 bool encodedBlobBytes(uint64_t announcedBytes, uint32_t* outEncodedBytes) {
@@ -1300,9 +1093,11 @@ bool encodedBlobBytes(uint64_t announcedBytes, uint32_t* outEncodedBytes) {
 } // namespace
 
 int main(int argc, char** argv) {
+    try {
     const ProgramOptions options = parseArgs(argc, argv);
     const std::string& inputPath = options.inputPath;
-    const uint32_t pageSize = options.pageSize;
+    const uint32_t imagePageSize = options.imagePageSize;
+    const uint32_t vmPageSize = options.vmPageSize;
     const auto& smallPrimes = fixedSmallPrimes();
 
     std::ifstream in(inputPath);
@@ -1432,6 +1227,7 @@ int main(int argc, char** argv) {
     namePublicByValue.reserve(4096);
 
     uint64_t countDir = 0;
+    uint64_t rootDirectoryCount = 0;
     uint64_t countFilePath = 0;
     uint64_t countSymlink = 0;
     uint64_t countFifoPath = 0;
@@ -1449,13 +1245,15 @@ int main(int argc, char** argv) {
     for (const auto& e : entries) {
         if (e.type == 'd') {
             ++countDir;
+            uniqueAttrKeys.insert(makeAttrKey(e));
+            if (e.path.empty())
+                ++rootDirectoryCount;
             directories.insert(e.path);
             if (!e.path.empty()) {
                 dirChildren[e.parent].push_back(e.name);
                 uniqueNames.insert(e.name);
                 const bool publicName = isPublicFilenamePath(e);
                 namePublicByValue[e.name] = namePublicByValue[e.name] || publicName;
-                uniqueAttrKeys.insert(makeAttrKey(e));
             }
             continue;
         }
@@ -1545,13 +1343,21 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (unsupported != 0 ||
+    if (parseErrors != 0 ||
+        rootDirectoryCount != 1 ||
+        unsupported != 0 ||
         duplicateInodeSizeMismatch != 0 ||
         duplicateInodeAttrMismatch != 0 ||
         duplicateFifoAttrMismatch != 0 ||
         symlinkHardlinkViolatingPaths != 0 ||
         fifoHardlinkViolatingPaths != 0) {
         std::cerr << "Input violates femtoFS source-tree mapping policy:\n";
+        if (parseErrors != 0)
+            std::cerr << "  unparsed input records: " << parseErrors << "\n";
+        if (rootDirectoryCount != 1) {
+            std::cerr << "  root directory records: " << rootDirectoryCount
+                      << " (required exactly 1)\n";
+        }
         if (unsupported != 0) {
             std::cerr << "  unsupported source inode kinds: " << unsupported << "\n";
         }
@@ -1581,34 +1387,34 @@ int main(int argc, char** argv) {
 
     struct MixedTrial {
         uint32_t p2 = 0;
-        MixedDoubleHashResult result;
+        MixedDualHashResult result;
     };
 
     std::vector<MixedTrial> mixedTrials;
     mixedTrials.clear();
     const MixedTrial* bestMixed = nullptr;
 
-    if (options.doubleHashExperiment) {
+    if (options.dualHashExperiment) {
         constexpr uint32_t kBigPrimeMin = (1u << 8) + 1u; // strictly greater than 2^8
         constexpr uint32_t kBigPrimeMax = (1u << 24);     // strictly less than 2^24
 
         const auto singleChoicesByDir = buildSingleHashChoiceByDirectoryKey(directories, dirChildren, smallPrimes);
-        const size_t sampleCount = std::max<size_t>(1, options.doubleHashSamples);
+        const size_t sampleCount = std::max<size_t>(1, options.dualHashSamples);
         const auto sampledPrimes = sampleRandomPrimes(
             kBigPrimeMin,
             kBigPrimeMax,
             sampleCount,
-            options.doubleHashSeed);
+            options.dualHashSeed);
 
         mixedTrials.reserve(sampledPrimes.size());
         for (uint32_t p2 : sampledPrimes) {
-            MixedDoubleHashResult result = simulateHashingMixedDoubleHash(
+            MixedDualHashResult result = simulateHashingMixedDualHash(
                 directories,
                 dirChildren,
                 singleChoicesByDir,
                 smallPrimes,
                 p2,
-                options.doubleHashHardThreshold);
+                options.dualHashHardThreshold);
             mixedTrials.push_back(MixedTrial{p2, std::move(result)});
         }
 
@@ -1632,29 +1438,45 @@ int main(int argc, char** argv) {
             return a.p2 < b.p2;
         });
 
-        if (!mixedTrials.empty()) {
+        if (!mixedTrials.empty() &&
+            mixedTrials.front().result.hardDirectories != 0) {
             bestMixed = &mixedTrials.front();
         }
     }
 
-    const HashSimulationSummary& selectedSummary = (bestMixed == nullptr) ? baseline : bestMixed->result.summary;
+    const uint64_t dirObjectCount = countDir - 1u; // root descriptor is in header
+    const uint64_t symlinkObjectCount = countSymlink;
+    const uint64_t metadataObjects = fileObjectCount + hardlinkObjectCount +
+        dirObjectCount + symlinkObjectCount + fifoObjectCount;
+    const uint64_t attrObjectCount = uniqueAttrKeys.size();
+    auto cellCountFor = [&](const HashSimulationSummary& summary) {
+        const uint64_t attrReuse = std::min<uint64_t>(
+            attrObjectCount, summary.totalEmptyBuckets);
+        return metadataObjects + summary.totalBuckets +
+               (attrObjectCount - attrReuse);
+    };
+
+    HashSimulationSummary selectedSummary = bestMixed == nullptr ?
+        baseline : bestMixed->result.summary;
+    bool hashBudgetFallback = false;
+    if (cellCountFor(selectedSummary) > femtofs::kMaxCellCount) {
+        selectedSummary = simulateMinimumHashing(
+            directories, dirChildren, smallPrimes);
+        hashBudgetFallback = true;
+    }
+    const bool selectedMixed = bestMixed != nullptr && !hashBudgetFallback;
     const double selectedWeightedMeanSquare = weightedMeanSquare(selectedSummary);
     const double selectedAvgSuccessfulLookupStrcmp = averageSuccessfulLookupStrcmp(selectedSummary);
-    const double selectedAvgUnsuccessfulLookupStrcmp = (bestMixed == nullptr)
-        ? baselineAvgUnsuccessfulLookupStrcmp
-        : bestMixed->result.unsuccessfulTwoProbe;
+    const double selectedAvgUnsuccessfulLookupStrcmp = selectedMixed ?
+        bestMixed->result.unsuccessfulTwoProbe :
+        averageUnsuccessfulLookupStrcmp(selectedSummary);
     const double selectedGlobalLoadFactor = globalLoadFactor(selectedSummary);
-    const uint64_t dirObjectCount = (countDir > 0) ? (countDir - 1) : 0; // root in header
-    const uint64_t symlinkObjectCount = countSymlink;
-    const uint64_t metadataObjects =
-        fileObjectCount + hardlinkObjectCount + dirObjectCount + symlinkObjectCount + fifoObjectCount;
     const uint64_t filelikeRoleCount = fileObjectCount + symlinkObjectCount + fifoObjectCount;
     const uint64_t dirRoleCount = dirObjectCount;
     const uint64_t hardlinkRoleCount = hardlinkObjectCount;
     const uint64_t bucketRoleCount = selectedSummary.totalBuckets;
     const uint64_t objectRoleCountTotal =
         dirRoleCount + filelikeRoleCount + hardlinkRoleCount + bucketRoleCount;
-    const uint64_t attrObjectCount = uniqueAttrKeys.size();
     const uint64_t attrCellsReused = std::min<uint64_t>(attrObjectCount, selectedSummary.totalEmptyBuckets);
     const uint64_t attrCellsExtended = attrObjectCount - attrCellsReused;
 
@@ -1677,9 +1499,13 @@ int main(int argc, char** argv) {
     uint64_t privateSymlinkTargetContentBlobs = 0;
     uint64_t publicSmallFilePayloads = 0;
     uint64_t privateSmallFilePayloads = 0;
-    uint64_t privateLargePartialPayloads = 0;
     uint64_t publicZeroLenFilePayloads = 0;
     uint64_t privateZeroLenFilePayloads = 0;
+    uint64_t filesAtMostVmPage = 0;
+    uint64_t vmAlignedLargeFiles = 0;
+    uint64_t vmAlignedLargeFilesWithTail = 0;
+    uint64_t potentiallyUnalignedLargeFiles = 0;
+    uint64_t alignedPublicMappableFiles = 0;
     uint64_t payloadEncodingOverflow = 0;
     uint64_t stringEncodingOverflow = 0;
 
@@ -1706,20 +1532,32 @@ int main(int argc, char** argv) {
             }
             continue;
         }
-        if (size < pageSize) {
+        if (size <= vmPageSize) {
+            ++filesAtMostVmPage;
+        } else if (vmPageSize <= imagePageSize &&
+                   encodedSize >= imagePageSize) {
+            ++vmAlignedLargeFiles;
+            if ((size % vmPageSize) != 0)
+                ++vmAlignedLargeFilesWithTail;
+        } else {
+            ++potentiallyUnalignedLargeFiles;
+        }
+        if (isPublic && vmPageSize <= imagePageSize &&
+            encodedSize >= imagePageSize) {
+            ++alignedPublicMappableFiles;
+        }
+
+        if (size < imagePageSize) {
             ++smallFilePayloads;
             if (isPublic) {
                 ++publicSmallFilePayloads;
             } else {
                 ++privateSmallFilePayloads;
             }
-        } else if ((size % pageSize) == 0) {
+        } else if ((size % imagePageSize) == 0) {
             ++largePageAlignedPayloads;
         } else {
             ++largePartialPayloads;
-            if (!isPublic) {
-                ++privateLargePartialPayloads;
-            }
         }
     }
 
@@ -1755,26 +1593,65 @@ int main(int argc, char** argv) {
         ++privateSymlinkTargetContentBlobs;
     }
 
-    const PackingStats packing = packContents(contentSizes, pageSize);
-    const VisibilitySplitPackingStats splitPacking = packContentsWithVisibilitySplit(classifiedContents, pageSize);
+    const PackingStats packing = packContents(contentSizes, imagePageSize);
+    const VisibilitySplitPackingStats splitPacking =
+        packContentsWithVisibilitySplit(classifiedContents, imagePageSize);
 
     const uint64_t objectTableEntries = metadataObjects + selectedSummary.totalBuckets + attrCellsExtended;
-    const uint64_t objectTableBytes = objectTableEntries * 16u;
-    const uint32_t headerBytes = 128u;
-    const uint32_t contentOff = alignUp(headerBytes + static_cast<uint32_t>(objectTableBytes), pageSize);
-    const uint64_t imageBytesEstimate = static_cast<uint64_t>(contentOff) + packing.paddedBytes;
-    const uint64_t splitImageBytesEstimate = static_cast<uint64_t>(contentOff) + splitPacking.combined.paddedBytes;
-    const uint64_t cleanCopiedPageObjects = smallFilePayloads + largePartialPayloads;
-    const uint64_t leakingCopiedPageObjects = privateSmallFilePayloads + privateLargePartialPayloads;
-    const uint64_t dirtyCopiedPageObjects = privateSmallFilePayloads + privateLargePartialPayloads;
+    const uint64_t objectTableBytes = objectTableEntries * femtofs::kCellSize;
+    const uint64_t headerBytes = femtofs::kHeaderSize;
+    const uint64_t publicOff = alignUp(headerBytes + objectTableBytes,
+                                       imagePageSize);
+    const uint64_t unsplitImageSize = alignUp(
+        publicOff + packing.paddedBytes, imagePageSize);
+    const uint64_t privateOff = alignUp(
+        publicOff + splitPacking.publicPool.paddedBytes, imagePageSize);
+    const uint64_t splitImageBytesEstimate = alignUp(
+        privateOff + splitPacking.privatePool.paddedBytes, imagePageSize);
+    const uint64_t splitContentRegionBytes = splitImageBytesEstimate - publicOff;
+    const uint64_t publicPartSpan = privateOff - publicOff;
+    const uint64_t privatePartSpan = splitImageBytesEstimate - privateOff;
+    const uint64_t unsplitTotalPadding =
+        unsplitImageSize - publicOff - packing.rawBytes;
+    const uint64_t splitTotalPadding =
+        splitContentRegionBytes - splitPacking.combined.rawBytes;
+    const bool vmForcesClean = vmPageSize > imagePageSize;
+    const uint64_t cleanAtMostOneCopyFiles =
+        filesAtMostVmPage + vmAlignedLargeFiles;
+    const uint64_t cleanCopiedPageUpperBoundForThoseFiles =
+        filesAtMostVmPage + vmAlignedLargeFilesWithTail;
     const uint64_t publicMappableFilePayloads = publicFilePayloads - publicZeroLenFilePayloads;
-    const uint64_t leakingDirectMapPublicObjects = publicMappableFilePayloads;
-    const uint64_t dirtyShiftedMapPublicObjects = publicSmallFilePayloads;
+    const uint64_t privateMappableFilePayloads = privateFilePayloads - privateZeroLenFilePayloads;
+    const uint64_t leakingAlignedPublicCandidates = vmForcesClean ? 0 :
+        alignedPublicMappableFiles;
+    const uint64_t dirtyShiftedPublicCandidates = vmForcesClean ? 0 :
+        publicSmallFilePayloads;
+    const bool metadataCellLimitExceeded =
+        objectTableEntries == 0 || objectTableEntries > femtofs::kMaxCellCount;
+    const bool objectLimitExceeded =
+        metadataObjects >= femtofs::kMaxDirectoryEntries;
+    const bool imageLimitExceeded = splitImageBytesEstimate >= (1ull << 32);
 
     const size_t topN = std::min<size_t>(12, selectedSummary.dirs.size());
 
     std::cout << "Input file: " << inputPath << "\n";
     std::cout << "Parsed lines: " << entries.size() << " (parse errors: " << parseErrors << ")\n\n";
+
+    std::cout << "Format model\n";
+    std::cout << "  specification baseline:       0x" << std::hex
+              << std::setw(4) << std::setfill('0') << femtofs::kVersion
+              << std::dec << std::setfill(' ') << "\n";
+    std::cout << "  byte order code:               0 (little-endian)\n";
+    std::cout << "  image PAGE_SIZE:               " << imagePageSize << "\n";
+    std::cout << "  encoded page-size code:        "
+              << pageFormatCode(imagePageSize) << "\n";
+    std::cout << "  kernel VM_PAGE_SIZE:           " << vmPageSize << "\n";
+    std::cout << "  effective mmap mode forced:    "
+              << (vmForcesClean ? "clean" : "none") << "\n";
+    if (imagePageSize != femtofs::kPageSize) {
+        std::cout << "  compatibility:                future-format experiment, not a valid 0x0100 image model\n";
+    }
+    std::cout << "\n";
 
     std::cout << "Filesystem inventory\n";
     std::cout << "  directories (including root): " << countDir << "\n";
@@ -1802,8 +1679,10 @@ int main(int argc, char** argv) {
     std::cout << "  dir objects (non-root):       " << dirObjectCount << "\n";
     std::cout << "  symlink objects:              " << symlinkObjectCount << "\n";
     std::cout << "  fifo objects:                 " << fifoObjectCount << "\n";
-    std::cout << "  metadata objects total:       " << metadataObjects << "\n";
-    std::cout << "  deduped attr objects:         " << attrObjectCount << "\n";
+    std::cout << "  non-root objects total:       " << metadataObjects << "\n";
+    std::cout << "  visible objects incl. root:   " << metadataObjects + 1u
+              << " (limit <= " << femtofs::kMaxDirectoryEntries << ")\n";
+    std::cout << "  deduped attr cells incl. root:" << attrObjectCount << "\n";
     std::cout << "  attr cells reusing empties:   " << attrCellsReused << "\n";
     std::cout << "  attr cells extending table:   " << attrCellsExtended << "\n";
     std::cout << "  hash buckets total:           " << selectedSummary.totalBuckets << "\n";
@@ -1813,26 +1692,35 @@ int main(int argc, char** argv) {
     std::cout << "    role=hardlink:              " << hardlinkRoleCount << "\n";
     std::cout << "    role=bucket:                " << bucketRoleCount << "\n";
     std::cout << "  metadata table cells total:   " << objectTableEntries
-              << " (limit < 65536)\n";
+              << " (limit <= " << femtofs::kMaxCellCount << ")\n";
     std::cout << "  metadata table bytes:         " << prettyBytes(objectTableBytes) << "\n";
+    std::cout << "  object limit status:          "
+              << (objectLimitExceeded ? "EXCEEDED" : "ok") << "\n";
+    std::cout << "  metadata cell limit status:   "
+              << (metadataCellLimitExceeded ? "EXCEEDED" : "ok") << "\n";
     std::cout << "\n";
 
     const double avgEmptiesPerDir =
         directories.empty() ? 0.0 : static_cast<double>(selectedSummary.totalEmptyBuckets) / static_cast<double>(directories.size());
 
     std::cout << "Directory hashing simulation (selected policy)\n";
-    if (bestMixed != nullptr) {
-        std::cout << "  selected policy:              mixed single/double-hash\n";
-        std::cout << "  selected p2:                  " << bestMixed->p2 << "\n";
-        std::cout << "  hard directory rule:          baseline max_chain > " << options.doubleHashHardThreshold << "\n";
+    if (selectedMixed) {
+        std::cout << "  selected policy:              mixed SINGLE/DUAL\n";
+        std::cout << "  hash2_base:                   " << bestMixed->p2 << "\n";
+        std::cout << "  hard directory rule:          baseline max_chain > " << options.dualHashHardThreshold << "\n";
         std::cout << "  hard directories switched:    " << bestMixed->result.hardDirectories
                   << " / " << directories.size() << "\n";
         std::cout << "  hard directories entry share: " << bestMixed->result.hardEntries
                   << " / " << selectedSummary.totalDirEntries << "\n";
+    } else if (hashBudgetFallback) {
+        std::cout << "  selected policy:              minimum SINGLE fallback (tablesize=N)\n";
+        std::cout << "  hash2_base:                   0\n";
+        std::cout << "  reason:                       preferred plan exceeds shared metadata-cell budget\n";
     } else {
         std::cout << "  selected policy:              single-hash baseline\n";
     }
-    std::cout << "  ceiling policy:              all sizes in [N, next_prime(2*N)], cap " << kMaxTablesizePrime << "\n";
+    std::cout << "  ceiling policy:              all sizes in [N, next_prime(2*N)], cap "
+              << femtofs::kMaxTableSize << "\n";
     std::cout << "  directories simulated:        " << directories.size() << "\n";
     std::cout << "  total dir entries (N sum):    " << selectedSummary.totalDirEntries << "\n";
     std::cout << "  total buckets:                " << selectedSummary.totalBuckets << "\n";
@@ -1849,7 +1737,7 @@ int main(int argc, char** argv) {
     std::cout << "  dirs fallback(score>=1.1):    " << selectedSummary.dirsFallback << "\n";
     std::cout << "  max chain observed:           " << selectedSummary.globalMaxChain << "\n";
     std::cout << "  dirs violating N<2^15:        " << selectedSummary.dirsOverHardLimit << "\n";
-    if (bestMixed != nullptr) {
+    if (selectedMixed) {
         std::cout << "  baseline max chain:           " << baseline.globalMaxChain << "\n";
         std::cout << "  baseline weighted mean-square:" << std::fixed << std::setprecision(4) << baselineWeightedMeanSquare << "\n";
         std::cout << "  baseline avg strcmp success:  " << std::fixed << std::setprecision(4) << baselineAvgSuccessfulLookupStrcmp << "\n";
@@ -1863,16 +1751,18 @@ int main(int argc, char** argv) {
         const double bestAvgSuccessfulLookupStrcmp = averageSuccessfulLookupStrcmp(bestSummary);
         const double bestGlobalLoadFactor = globalLoadFactor(bestSummary);
         const int64_t deltaBuckets = static_cast<int64_t>(bestSummary.totalBuckets) - static_cast<int64_t>(baseline.totalBuckets);
-        const int64_t deltaMetaBytes = deltaBuckets * 16;
+        const int64_t deltaMetaBytes = deltaBuckets * femtofs::kCellSize;
         const size_t topMixedN = std::min<size_t>(8, bestSummary.dirs.size());
 
-        std::cout << "Mixed single/double-hash tuning details\n";
-        std::cout << "  p1 candidates:                fixed small-prime set\n";
-        std::cout << "  p2 search range:              (" << (1u << 8) << ", " << (1u << 24) << ")\n";
-        std::cout << "  hard directory rule:          baseline max_chain > " << options.doubleHashHardThreshold << "\n";
+        std::cout << "Mixed SINGLE/DUAL tuning details\n";
+        std::cout << "  p1 candidates:                "
+                  << femtofs::kSmallPrimes.size()
+                  << "-entry SMALL_PRIMES index map\n";
+        std::cout << "  hash2_base search range:      (" << (1u << 8) << ", " << (1u << 24) << ")\n";
+        std::cout << "  hard directory rule:          baseline max_chain > " << options.dualHashHardThreshold << "\n";
         std::cout << "  sampled random primes:        " << mixedTrials.size() << "\n";
-        std::cout << "  RNG seed:                     " << options.doubleHashSeed << "\n";
-        std::cout << "  best p2:                      " << bestMixed->p2 << "\n";
+        std::cout << "  RNG seed:                     " << options.dualHashSeed << "\n";
+        std::cout << "  best hash2_base:              " << bestMixed->p2 << "\n";
         std::cout << "  hard directories switched:    " << bestMixed->result.hardDirectories
                   << " / " << directories.size() << "\n";
         std::cout << "  hard directories entry share: " << bestMixed->result.hardEntries
@@ -1894,7 +1784,7 @@ int main(int argc, char** argv) {
                   << bestMixed->result.unsuccessfulTwoProbe << "\n";
 
         std::cout << "  top random-prime candidates\n";
-        std::cout << "    p2 | max_chain | weighted_ms | buckets | miss_2probe_hard\n";
+        std::cout << "    hash2_base | max_chain | weighted_ms | buckets | miss_2probe_hard\n";
         for (size_t i = 0; i < std::min<size_t>(5, mixedTrials.size()); ++i) {
             const auto& t = mixedTrials[i];
             const auto& s = t.result.summary;
@@ -1907,12 +1797,13 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "  worst dirs by max_chain (best mixed)\n";
-        std::cout << "    path | N | tablesize | p1 | score | max_chain\n";
+        std::cout << "    path | N | tablesize | p1_index | p1 | score | max_chain\n";
         for (size_t i = 0; i < topMixedN; ++i) {
             const auto& d = bestSummary.dirs[i];
             std::cout << "    " << d.path
                       << " | " << d.n
                       << " | " << d.choice.tablesize
+                      << " | " << smallPrimeIndex(d.choice.p)
                       << " | " << d.choice.p
                       << " | " << std::fixed << std::setprecision(4) << d.choice.score
                       << " | " << d.choice.maxChain
@@ -1954,7 +1845,7 @@ int main(int argc, char** argv) {
             const double tunedWeightedMeanSquare = weightedMeanSquare(tuned.summary);
             const double tunedAvgSuccessfulLookupStrcmp = averageSuccessfulLookupStrcmp(tuned.summary);
             const double tunedAvgUnsuccessfulLookupStrcmp = averageUnsuccessfulLookupStrcmp(tuned.summary);
-            const uint64_t usedBytes = tuned.usedBuckets * 16u;
+            const uint64_t usedBytes = tuned.usedBuckets * femtofs::kCellSize;
 
             std::cout << "  tuned-budget"
                       << " | " << budgetKiB
@@ -1972,12 +1863,13 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Worst directories by score\n";
-    std::cout << "  path | N | tablesize | p | score | max_chain | empties | hit_ceiling\n";
+    std::cout << "  path | N | tablesize | p1_index | p1 | score | max_chain | empties | hit_ceiling\n";
     for (size_t i = 0; i < topN; ++i) {
         const auto& d = selectedSummary.dirs[i];
         std::cout << "  " << d.path
                   << " | " << d.n
                   << " | " << d.choice.tablesize
+                  << " | " << smallPrimeIndex(d.choice.p)
                   << " | " << d.choice.p
                   << " | " << std::fixed << std::setprecision(4) << d.choice.score
                   << " | " << d.choice.maxChain
@@ -2144,27 +2036,36 @@ int main(int argc, char** argv) {
         std::cout << "\n";
     }
 
-    std::cout << "mmap copy-page profile (per canonical file object)\n";
-    std::cout << "  small (<PAGE_SIZE):           " << smallFilePayloads << "\n";
-    std::cout << "  large page-multiple:          " << largePageAlignedPayloads << "\n";
-    std::cout << "  large with tail page:         " << largePartialPayloads << "\n";
-    std::cout << "  zero-length payload objects:  " << zeroLenFilePayloads << "\n";
-    std::cout << "  clean copied-page objects:    " << cleanCopiedPageObjects << "\n";
-    std::cout << "  leaking copied-page objects:  " << leakingCopiedPageObjects << "\n";
-    std::cout << "  dirty copied-page objects:    " << dirtyCopiedPageObjects << "\n";
-    std::cout << "  leaking direct public objects:" << leakingDirectMapPublicObjects << "\n";
-    std::cout << "  dirty shifted public objects: " << dirtyShiftedMapPublicObjects << "\n";
+    std::cout << "mmap profile (per canonical regular-file object)\n";
+    std::cout << "  image-small (size < PAGE_SIZE):" << smallFilePayloads << "\n";
+    std::cout << "  image-page-multiple files:     " << largePageAlignedPayloads << "\n";
+    std::cout << "  image-large with tail:         " << largePartialPayloads << "\n";
+    std::cout << "  zero-length files:             " << zeroLenFilePayloads << "\n";
+    std::cout << "  size <= VM_PAGE_SIZE:          " << filesAtMostVmPage << "\n";
+    std::cout << "  VM-aligned larger files:       " << vmAlignedLargeFiles << "\n";
+    std::cout << "    with partial VM tail:        " << vmAlignedLargeFilesWithTail << "\n";
+    std::cout << "  potentially unaligned larger:  " << potentiallyUnalignedLargeFiles << "\n";
+    std::cout << "  clean <=1-copy-page files:     " << cleanAtMostOneCopyFiles << "\n";
+    std::cout << "  copied-page upper bound there: " << cleanCopiedPageUpperBoundForThoseFiles << "\n";
+    std::cout << "  public nonempty files:         " << publicMappableFilePayloads << "\n";
+    std::cout << "  private nonempty (clean-only): " << privateMappableFilePayloads << "\n";
+    std::cout << "  leaking guaranteed-aligned:    " << leakingAlignedPublicCandidates << "\n";
+    std::cout << "  dirty sub-page candidates:     " << dirtyShiftedPublicCandidates << "\n";
+    std::cout << "  private image-small files:     " << privateSmallFilePayloads << "\n";
+    if (vmForcesClean)
+        std::cout << "  note: VM_PAGE_SIZE > PAGE_SIZE, so leaking/dirty are forced to clean\n";
     std::cout << "\n";
 
-    std::cout << "Content-part packing simulation (page size " << pageSize << ")\n";
+    std::cout << "Content-part packing simulation (image PAGE_SIZE "
+              << imagePageSize << ")\n";
     std::cout << "  unique payload objects:       " << filePayloadByInode.size() << "\n";
     std::cout << "  unique filename strings:      " << uniqueNames.size() << "\n";
     std::cout << "  unique symlink targets:       " << uniqueSymlinkTargets.size() << "\n";
     std::cout << "  unique string blobs total:    " << (uniqueNames.size() + uniqueSymlinkTargets.size()) << "\n";
     std::cout << "  packed contents count:        " << packing.contentCount << "\n";
     std::cout << "  stored blob bytes:            " << prettyBytes(packing.rawBytes) << "\n";
-    std::cout << "  page-packed content bytes:    " << prettyBytes(packing.paddedBytes) << "\n";
-    std::cout << "  padding overhead:             " << prettyBytes(packing.paddingBytes)
+    std::cout << "  page-packed tail bytes:       " << prettyBytes(packing.paddedBytes) << "\n";
+    std::cout << "  internal packing holes:       " << prettyBytes(packing.paddingBytes)
               << " (" << std::fixed << std::setprecision(4)
               << ((packing.rawBytes == 0) ? 0.0 :
                   (100.0 * static_cast<double>(packing.paddingBytes) / static_cast<double>(packing.rawBytes)))
@@ -2184,39 +2085,59 @@ int main(int argc, char** argv) {
     std::cout << "  private symlink blobs:        " << privateSymlinkTargetContentBlobs << "\n";
     std::cout << "  public part stored bytes:     " << prettyBytes(splitPacking.publicPool.rawBytes) << "\n";
     std::cout << "  private part stored bytes:    " << prettyBytes(splitPacking.privatePool.rawBytes) << "\n";
-    std::cout << "  public part packed bytes:     " << prettyBytes(splitPacking.publicPool.paddedBytes) << "\n";
-    std::cout << "  private part packed bytes:    " << prettyBytes(splitPacking.privatePool.paddedBytes) << "\n";
-    std::cout << "  split padded bytes total:     " << prettyBytes(splitPacking.combined.paddedBytes) << "\n";
-    std::cout << "  split padding overhead:       " << prettyBytes(splitPacking.combined.paddingBytes)
+    std::cout << "  public packed tail bytes:     " << prettyBytes(splitPacking.publicPool.paddedBytes) << "\n";
+    std::cout << "  public part span to boundary: " << prettyBytes(publicPartSpan) << "\n";
+    std::cout << "  private packed tail bytes:    " << prettyBytes(splitPacking.privatePool.paddedBytes) << "\n";
+    std::cout << "  private part span to EOF:     " << prettyBytes(privatePartSpan) << "\n";
+    std::cout << "  packed tails total:           " << prettyBytes(splitPacking.combined.paddedBytes) << "\n";
+    std::cout << "  split total padding to EOF:   " << prettyBytes(splitTotalPadding)
               << " (" << std::fixed << std::setprecision(4)
               << ((splitPacking.combined.rawBytes == 0) ? 0.0 :
-                  (100.0 * static_cast<double>(splitPacking.combined.paddingBytes) /
+                  (100.0 * static_cast<double>(splitTotalPadding) /
                    static_cast<double>(splitPacking.combined.rawBytes)))
               << "%)\n";
-    std::cout << "  delta padded bytes:           " << std::showpos
-              << static_cast<int64_t>(splitPacking.combined.paddedBytes) - static_cast<int64_t>(packing.paddedBytes)
+    std::cout << "  delta total padding:          " << std::showpos
+              << static_cast<int64_t>(splitTotalPadding) - static_cast<int64_t>(unsplitTotalPadding)
               << std::noshowpos << " B\n";
     std::cout << "\n";
 
     std::cout << "Whole-image size estimate\n";
     std::cout << "  header bytes:                 " << headerBytes << "\n";
     std::cout << "  metadata table bytes:         " << objectTableBytes << "\n";
-    std::cout << "  content_off (aligned):        " << contentOff << "\n";
-    std::cout << "  content region bytes:         " << packing.paddedBytes << "\n";
-    std::cout << "  total image estimate:         " << prettyBytes(imageBytesEstimate)
-              << " (" << imageBytesEstimate << " bytes)\n";
-    std::cout << "  split content bytes:          " << splitPacking.combined.paddedBytes << "\n";
-    std::cout << "  split image estimate:         " << prettyBytes(splitImageBytesEstimate)
+    std::cout << "  public_off:                   " << publicOff << "\n";
+    std::cout << "  private_off:                  " << privateOff << "\n";
+    std::cout << "  content region incl. gaps:    " << splitContentRegionBytes << "\n";
+    std::cout << "  image_size:                   " << prettyBytes(splitImageBytesEstimate)
               << " (" << splitImageBytesEstimate << " bytes)\n";
+    std::cout << "  image-size limit status:      "
+              << (imageLimitExceeded ? "EXCEEDED" : "ok") << "\n";
+    std::cout << "  unsplit comparison image:     " << prettyBytes(unsplitImageSize)
+              << " (" << unsplitImageSize << " bytes)\n";
     std::cout << "\n";
 
     std::cout << "Assumptions\n";
     std::cout << "  - regular-file payload dedup estimated by inode identity (captures hardlinks).\n";
+    std::cout << "  - find -ls supplies no device number; inode identity is therefore assumed input-global.\n";
+    std::cout << "  - owner/group names stand in for numeric IDs when estimating attribute dedup.\n";
     std::cout << "  - cross-inode byte-identical dedup is unknown from find -ls and not modeled.\n";
     std::cout << "  - therefore cross-visibility promotion of identical payload bytes may be under-modeled.\n";
     std::cout << "  - symlink targets are modeled as private-only blobs outside payload/filename shared dedup domain.\n";
     std::cout << "  - blob storage uses align_up(announced+1, 4) before page-packing simulation.\n";
     std::cout << "  - directory hash quality is exact for names present in input list.\n";
+    std::cout << "  - find -ls has no content offsets; mmap candidates count only alignment guaranteed by packing rules.\n";
 
-    return 0;
+    const bool formatLimitsExceeded = objectLimitExceeded ||
+        metadataCellLimitExceeded || imageLimitExceeded ||
+        selectedSummary.dirsOverHardLimit != 0 ||
+        payloadEncodingOverflow != 0 || stringEncodingOverflow != 0;
+    std::cout << "\nStructural format-limit result: "
+              << (formatLimitsExceeded ? "INVALID" : "representable") << "\n";
+
+    return formatLimitsExceeded ? 2 : 0;
+    } catch (const std::exception& error) {
+        std::cerr << "femtofsSim: " << error.what() << '\n';
+        return 1;
+    }
 }
+
+// END File: programs/femtofsSim.cpp

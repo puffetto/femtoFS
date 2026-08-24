@@ -1,5 +1,6 @@
 // File: units/test-isPrime.cpp
-// Unit tests for include/utilities/isPrime.h
+// Created by Andrea "Nemesi" Cocito on 31/03/2026
+// Unit tests for include/isPrime.h
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -35,7 +36,10 @@ concept ForwardedUnsigned =
     std::unsigned_integral<UInt> &&
     (!std::same_as<UInt, bool>) &&
     (!std::same_as<UInt, uint32_t>) &&
-    (!std::same_as<UInt, uint64_t>);
+#if defined(UINT64_MAX) && defined(__SIZEOF_INT128__)
+    (!std::same_as<UInt, uint64_t>) &&
+#endif
+    std::invocable<decltype(utilities::isPrime), UInt>;
 
 template <ForwardedUnsigned UInt>
 void checkForwardedUnsignedPrimeComposite(const UInt primeCandidate,
@@ -58,8 +62,32 @@ void maybeCheckWiderForwardedUnsigned(bool &exercisedWiderForwarding)
     }
 }
 
+template <std::signed_integral Int>
+void maybeCheckSignedForwarding()
+{
+    if constexpr (std::invocable<decltype(utilities::isPrime), Int>) {
+        REQUIRE(utilities::isPrime(static_cast<Int>(97)));
+        REQUIRE_FALSE(utilities::isPrime(static_cast<Int>(100)));
+    }
+}
+
+template <typename UInt>
+void checkOptionalUint64Overload()
+{
+    if constexpr (std::invocable<decltype(utilities::isPrime), UInt>) {
+        using utilities::isPrime;
+
+        REQUIRE(isPrime(UInt{97})); // Delegates to uint32 overload
+        REQUIRE_FALSE(isPrime(UInt{std::numeric_limits<uint32_t>::max()}));
+        REQUIRE_FALSE(isPrime(UInt{4294967301ULL}));
+        REQUIRE_FALSE(isPrime(UInt{18446744073709551556ULL}));
+        REQUIRE_FALSE(isPrime(UInt{4294967297ULL}));
+        REQUIRE(isPrime(UInt{18446744073709551557ULL}));
+    }
+}
+
 struct ExhaustivePrimeHashResult {
-    uint64_t primeCount{};
+    std::uint_least64_t primeCount{};
     std::string sha256Hex;
     double elapsedSeconds{};
 };
@@ -83,12 +111,12 @@ struct ExhaustivePrimeHashResult {
         throw std::runtime_error("EVP_DigestInit_ex failed");
     }
 
-    constexpr uint64_t limit = (1ULL << 32);
-    uint64_t primeCount = 0;
+    constexpr std::uint_least64_t limit = (1ULL << 32);
+    std::uint_least64_t primeCount = 0;
 
     const auto t0 = std::chrono::steady_clock::now();
 
-    for (uint64_t n = 0; n < limit; ++n) {
+    for (std::uint_least64_t n = 0; n < limit; ++n) {
         const uint32_t v = static_cast<uint32_t>(n);
         if (!utilities::isPrime(v))
             continue;
@@ -126,15 +154,26 @@ struct ExhaustivePrimeHashResult {
 
 } // namespace
 
-static_assert(std::invocable<decltype(utilities::isPrime), signed char>);
-static_assert(std::invocable<decltype(utilities::isPrime), short>);
-static_assert(std::invocable<decltype(utilities::isPrime), int>);
-static_assert(std::invocable<decltype(utilities::isPrime), long>);
-static_assert(std::invocable<decltype(utilities::isPrime), long long>);
 static_assert(std::invocable<decltype(utilities::isPrime), uint8_t>);
 static_assert(std::invocable<decltype(utilities::isPrime), uint16_t>);
 static_assert(std::invocable<decltype(utilities::isPrime), uint32_t>);
+#if defined(UINT64_MAX) && defined(__SIZEOF_INT128__)
+constexpr int maxSupportedBits = 64;
 static_assert(std::invocable<decltype(utilities::isPrime), uint64_t>);
+#else
+constexpr int maxSupportedBits = 32;
+static_assert(!std::invocable<decltype(utilities::isPrime), std::uint_least64_t>);
+#endif
+static_assert(std::invocable<decltype(utilities::isPrime), signed char> ==
+              (std::numeric_limits<signed char>::digits <= maxSupportedBits));
+static_assert(std::invocable<decltype(utilities::isPrime), short> ==
+              (std::numeric_limits<short>::digits <= maxSupportedBits));
+static_assert(std::invocable<decltype(utilities::isPrime), int> ==
+              (std::numeric_limits<int>::digits <= maxSupportedBits));
+static_assert(std::invocable<decltype(utilities::isPrime), long> ==
+              (std::numeric_limits<long>::digits <= maxSupportedBits));
+static_assert(std::invocable<decltype(utilities::isPrime), long long> ==
+              (std::numeric_limits<long long>::digits <= maxSupportedBits));
 static_assert(!std::invocable<decltype(utilities::isPrime), bool>);
 
 TEST_CASE("isPrime covers uint32 prefilter and FJ32_256 paths", "[isPrime]")
@@ -158,16 +197,11 @@ TEST_CASE("isPrime covers uint32 prefilter and FJ32_256 paths", "[isPrime]")
 
 TEST_CASE("isPrime covers uint64 delegation, prefilter, and Miller-Rabin", "[isPrime]")
 {
-    using utilities::isPrime;
-
-    REQUIRE(isPrime(uint64_t{97})); // Delegates to uint32 overload
-    REQUIRE_FALSE(isPrime(uint64_t{std::numeric_limits<uint32_t>::max()})); // Delegates
-
-    REQUIRE_FALSE(isPrime(uint64_t{4294967301ULL})); // > 32-bit, prefilter composite (divisible by 3)
-    REQUIRE_FALSE(isPrime(uint64_t{18446744073709551556ULL})); // > 32-bit, even composite
-
-    REQUIRE_FALSE(isPrime(uint64_t{4294967297ULL})); // > 32-bit, MR64 composite
-    REQUIRE(isPrime(uint64_t{18446744073709551557ULL})); // > 32-bit, MR64 prime
+#if defined(UINT64_MAX)
+    checkOptionalUint64Overload<uint64_t>();
+#else
+    SUCCEED("No exact-width uint64_t on this implementation");
+#endif
 }
 
 TEST_CASE("isPrime covers signed forwarding overload", "[isPrime]")
@@ -181,8 +215,8 @@ TEST_CASE("isPrime covers signed forwarding overload", "[isPrime]")
     REQUIRE(isPrime(static_cast<signed char>(97)));
     REQUIRE(isPrime(static_cast<short>(97)));
     REQUIRE(isPrime(97));
-    REQUIRE(isPrime(static_cast<long>(97)));
-    REQUIRE(isPrime(static_cast<long long>(97)));
+    maybeCheckSignedForwarding<long>();
+    maybeCheckSignedForwarding<long long>();
 }
 
 TEST_CASE("isPrime covers unsigned forwarding overload", "[isPrime]")
@@ -205,15 +239,19 @@ TEST_CASE("isPrime internal helpers can be directly exercised", "[isPrime][inter
     using Prime = utilities::PrimalityTestFunctor;
     using PrefilterResult = Prime::PrefilterResult;
 
-    REQUIRE(Prime::prefilter<uint64_t>(uint64_t{313}) == PrefilterResult::prime);
-    REQUIRE(Prime::prefilter<uint64_t>(uint64_t{4294967297ULL}) == PrefilterResult::undecided);
-    REQUIRE(Prime::prefilter<uint64_t>(uint64_t{4294967301ULL}) == PrefilterResult::composite);
+    REQUIRE(Prime::prefilter<std::uint_least64_t>(std::uint_least64_t{313}) ==
+            PrefilterResult::prime);
+    REQUIRE(Prime::prefilter<std::uint_least64_t>(std::uint_least64_t{4294967297ULL}) ==
+            PrefilterResult::undecided);
+    REQUIRE(Prime::prefilter<std::uint_least64_t>(std::uint_least64_t{4294967301ULL}) ==
+            PrefilterResult::composite);
 
     {
         constexpr uint32_t n = 61;
         const auto mulMod = [](const uint32_t a, const uint32_t b) noexcept -> uint32_t {
             return static_cast<uint32_t>(
-                (static_cast<uint64_t>(a) * static_cast<uint64_t>(b)) % n
+                (static_cast<std::uint_least64_t>(a) *
+                 static_cast<std::uint_least64_t>(b)) % n
             );
         };
 
@@ -234,7 +272,8 @@ TEST_CASE("isPrime internal helpers can be directly exercised", "[isPrime][inter
         constexpr uint32_t n = 15;
         const auto mulMod = [](const uint32_t a, const uint32_t b) noexcept -> uint32_t {
             return static_cast<uint32_t>(
-                (static_cast<uint64_t>(a) * static_cast<uint64_t>(b)) % n
+                (static_cast<std::uint_least64_t>(a) *
+                 static_cast<std::uint_least64_t>(b)) % n
             );
         };
 
@@ -246,7 +285,7 @@ TEST_CASE("isPrime internal helpers can be directly exercised", "[isPrime][inter
 
 TEST_CASE("isPrime exhaustive uint32 prime-stream hash", "[isPrime][exhaustive][slow]")
 {
-    constexpr uint64_t kExpectedPrimeCount = 203280221ULL;
+    constexpr std::uint_least64_t kExpectedPrimeCount = 203280221ULL;
     constexpr std::string_view kExpectedSha256 =
         "60a21e2a7397a9e3ad8bc09ccff80a44ccde2c5018432e2bb94cf0fc72130e44";
 

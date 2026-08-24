@@ -1,3 +1,6 @@
 .idea
 cmake-build-*
+tmp
+misc
+AGENTS.md
 

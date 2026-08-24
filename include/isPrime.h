@@ -1,6 +1,6 @@
-// File: include/utilities/isPrime.h
-// Created by Andrea Cocito on 14/03/26.
-//
+// File: include/isPrime.h
+// Created by Andrea "Nemesi" Cocito on 14/03/2026
+// Header-only deterministic primality tests for integer domains up to 64 bits.
 
 #pragma once
 
@@ -10,13 +10,15 @@
 #include <cstdint>
 #include <limits>
 
-#if !defined(__SIZEOF_INT128__)
-#error "utilities::isPrime requires compiler support for unsigned __int128 in the uint64_t overload."
+#if defined(UINT64_MAX) && defined(__SIZEOF_INT128__)
+#define UTILITIES_IS_PRIME_HAS_UINT64_OVERLOAD 1
+#else
+#define UTILITIES_IS_PRIME_HAS_UINT64_OVERLOAD 0
 #endif
 
 /**
  * @file isPrime.h
- * @brief Header-only deterministic primality test for integral values up to 64 bits.
+ * @brief Header-only deterministic primality test for integral values up to 32 or 64 bits.
  */
 
 namespace utilities {
@@ -27,13 +29,13 @@ namespace utilities {
  * The intended public API is the global object @ref utilities::isPrime, used as:
  *
  * @code{.cpp}
- * #include <utilities/isPrime.h>
+ * #include <isPrime.h>
  * #include <cstdint>
  *
- * bool a = utilities::isPrime(uint32_t{97});                      // true
- * bool b = utilities::isPrime(uint32_t{100});                     // false
- * bool c = utilities::isPrime(uint64_t{18446744073709551557ULL}); // true
- * bool d = utilities::isPrime(uint64_t{18446744073709551556ULL}); // false
+ * bool a = utilities::isPrime(std::uint32_t{97});  // true
+ * bool b = utilities::isPrime(std::uint32_t{100}); // false
+ * // The uint64_t overload is also available when the compiler supports
+ * // unsigned __int128.
  * @endcode
  *
  * Internally, the implementation is split into two stages:
@@ -51,15 +53,28 @@ namespace utilities {
  *
  * - no dynamic allocation;
  * - one shared compile-time small-prime table;
- * - deterministic over the full @c uint32_t and @c uint64_t domains;
- * - the @c uint64_t overload delegates to the @c uint32_t overload whenever
- *   the input fits in 32 bits.
+ * - deterministic over the full @c uint32_t domain using only standard C++
+ *   integer types;
+ * - when @c unsigned __int128 is available, deterministic over the full
+ *   @c uint64_t domain as well;
+ * - the optional @c uint64_t overload delegates to the @c uint32_t overload
+ *   whenever the input fits in 32 bits.
  *
- * @note The @c uint64_t overload uses @c unsigned __int128 for exact modular
- *       multiplication without overflow.
+ * @note The @c uint64_t overload is omitted when either exact-width
+ *       @c uint64_t or @c unsigned __int128 is unavailable. In that case,
+ *       overloads accepting values wider than the @c uint32_t domain are
+ *       omitted as well.
  */
 class PrimalityTestFunctor final
 {
+private:
+    inline static constexpr int maxSupportedBits =
+#if UTILITIES_IS_PRIME_HAS_UINT64_OVERLOAD
+        64;
+#else
+        32;
+#endif
+
 public:
     /**
      * @brief Disallow boolean inputs explicitly.
@@ -74,43 +89,45 @@ public:
      * the unsigned overloads.
      */
     template <std::signed_integral Int>
+    requires (std::numeric_limits<Int>::digits <= maxSupportedBits)
     [[nodiscard]] bool operator()(Int n) const noexcept
     {
         if (n < 2)
             return false;
 
-        if constexpr (sizeof(Int) <= sizeof(uint32_t)) {
-            return (*this)(static_cast<uint32_t>(n));
-        } else if constexpr (sizeof(Int) <= sizeof(uint64_t)) {
-            return (*this)(static_cast<uint64_t>(n));
-        } else {
-            static_assert(sizeof(Int) <= sizeof(uint64_t),
-                          "utilities::isPrime supports signed integers up to 64 bits");
-            return false;
+        if constexpr (std::numeric_limits<Int>::digits <=
+                      std::numeric_limits<std::uint32_t>::digits) {
+            return (*this)(static_cast<std::uint32_t>(n));
         }
+
+#if UTILITIES_IS_PRIME_HAS_UINT64_OVERLOAD
+        return (*this)(static_cast<std::uint64_t>(n));
+#endif
     }
 
     /**
-     * @brief Forwarding overload for unsigned integer types other than uint32_t/uint64_t.
+     * @brief Forwarding overload for supported unsigned integer types.
      *
-     * Values up to 32 bits are widened to @c uint32_t, values up to 64 bits to
-     * @c uint64_t. Wider unsigned types are rejected at compile time.
+     * Values up to 32 bits are widened to @c uint32_t. When the optional
+     * @c uint64_t overload is available, values up to 64 bits are widened to it.
      */
     template <std::unsigned_integral UInt>
     requires (!std::same_as<UInt, bool> &&
-              !std::same_as<UInt, uint32_t> &&
-              !std::same_as<UInt, uint64_t>)
+              !std::same_as<UInt, std::uint32_t> &&
+#if UTILITIES_IS_PRIME_HAS_UINT64_OVERLOAD
+              !std::same_as<UInt, std::uint64_t> &&
+#endif
+              std::numeric_limits<UInt>::digits <= maxSupportedBits)
     [[nodiscard]] bool operator()(UInt n) const noexcept
     {
-        if constexpr (sizeof(UInt) <= sizeof(uint32_t)) {
-            return (*this)(static_cast<uint32_t>(n));
-        } else if constexpr (sizeof(UInt) <= sizeof(uint64_t)) {
-            return (*this)(static_cast<uint64_t>(n));
-        } else {
-            static_assert(sizeof(UInt) <= sizeof(uint64_t),
-                          "utilities::isPrime supports unsigned integers up to 64 bits");
-            return false;
+        if constexpr (std::numeric_limits<UInt>::digits <=
+                      std::numeric_limits<std::uint32_t>::digits) {
+            return (*this)(static_cast<std::uint32_t>(n));
         }
+
+#if UTILITIES_IS_PRIME_HAS_UINT64_OVERLOAD
+        return (*this)(static_cast<std::uint64_t>(n));
+#endif
     }
 
     /**
@@ -121,9 +138,9 @@ public:
      * @param n Value to test.
      * @return @c true if @p n is prime, @c false otherwise.
      */
-    [[nodiscard]] bool operator()(uint32_t n) const noexcept
+    [[nodiscard]] bool operator()(std::uint32_t n) const noexcept
     {
-        switch (prefilter<uint32_t>(n)) {
+        switch (prefilter<std::uint32_t>(n)) {
             case PrefilterResult::prime:
                 return true;
 
@@ -137,6 +154,7 @@ public:
         return fj32_256(n);
     }
 
+#if UTILITIES_IS_PRIME_HAS_UINT64_OVERLOAD
     /**
      * @brief Test whether a 64-bit unsigned integer is prime.
      *
@@ -148,12 +166,12 @@ public:
      * @param n Value to test.
      * @return @c true if @p n is prime, @c false otherwise.
      */
-    [[nodiscard]] bool operator()(uint64_t n) const noexcept
+    [[nodiscard]] bool operator()(std::uint64_t n) const noexcept
     {
-        if (n <= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
-            return (*this)(static_cast<uint32_t>(n));
+        if (n <= static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))
+            return (*this)(static_cast<std::uint32_t>(n));
 
-        switch (prefilter<uint64_t>(n)) {
+        switch (prefilter<std::uint64_t>(n)) {
             case PrefilterResult::prime:
                 return true;
 
@@ -166,12 +184,13 @@ public:
 
         return millerRabin64(n);
     }
+#endif
 
 private:
     /**
      * @brief Result of the shared small-prime prefilter.
      */
-    enum class PrefilterResult : uint8_t {
+    enum class PrefilterResult : std::uint8_t {
         composite, /**< Input is definitely composite. */
         prime,     /**< Input is definitely prime. */
         undecided  /**< Further Miller-Rabin testing is required. */
@@ -184,7 +203,7 @@ private:
      * After trial division, the test can immediately accept any candidate
      * @c n such that @c n < smallPrimes.back()^2.
      */
-    inline static constexpr std::array<uint16_t, 63> smallPrimes{
+    inline static constexpr std::array<std::uint16_t, 63> smallPrimes{
         3, 5, 7, 11, 13, 17, 19,
         23, 29, 31, 37, 41, 43, 47, 53,
         59, 61, 67, 71, 73, 79, 83, 89,
@@ -207,7 +226,7 @@ private:
      * - a final shortcut using the fact that if no prime divisor <= sqrt(n)
      *   exists, then @p n is prime.
      *
-     * @tparam UInt Unsigned integer type, expected to be @c uint32_t or @c uint64_t.
+     * @tparam UInt Unsigned integer type supported by a public overload.
      * @param n Value to test.
      * @return A three-state result indicating whether @p n is already decided
      *         or must proceed to the second-stage primality backend.
@@ -223,13 +242,13 @@ private:
                                 : PrefilterResult::composite;
 
         if (n <= static_cast<UInt>(smallPrimes.back())) {
-            const auto needle = static_cast<uint16_t>(n);
+            const auto needle = static_cast<std::uint16_t>(n);
             return std::ranges::binary_search(smallPrimes, needle)
                 ? PrefilterResult::prime
                 : PrefilterResult::composite;
         }
 
-        for (const uint16_t p : smallPrimes) {
+        for (const std::uint16_t p : smallPrimes) {
             if (n % static_cast<UInt>(p) == UInt{0})
                 return PrefilterResult::composite;
         }
@@ -312,7 +331,7 @@ private:
      * Combined with the FJ32 hash and one SPRP round, this is deterministic
      * over the full @c uint32_t domain.
      */
-    inline static constexpr std::array<uint16_t, 256> fj32Bases{
+    inline static constexpr std::array<std::uint16_t, 256> fj32Bases{
         15591u, 2018u, 166u, 7429u, 8064u, 16045u, 10503u, 4399u,
         1949u, 1295u, 2776u, 3620u, 560u, 3128u, 5212u, 2657u,
         2300u, 2021u, 4652u, 1471u, 9336u, 4018u, 2398u, 20462u,
@@ -350,13 +369,16 @@ private:
     /**
      * @brief FJ32 hash used to select one base out of @ref fj32Bases.
      */
-    [[nodiscard]] static uint8_t hashFj32_256(uint32_t n) noexcept
+    [[nodiscard]] static std::uint8_t hashFj32_256(std::uint32_t n) noexcept
     {
-        uint64_t h = n;
-        h = ((h >> 16u) ^ h) * 0x45d9f3bu;
-        h = ((h >> 16u) ^ h) * 0x45d9f3bu;
+        // Preserve modulo-2^64 arithmetic if uint_least64_t is wider than 64 bits.
+        constexpr std::uint_least64_t mask64 = 0xffffffffffffffffULL;
+
+        std::uint_least64_t h = n;
+        h = (((h >> 16u) ^ h) * 0x45d9f3bu) & mask64;
+        h = (((h >> 16u) ^ h) * 0x45d9f3bu) & mask64;
         h = ((h >> 16u) ^ h);
-        return static_cast<uint8_t>(h & 255u);
+        return static_cast<std::uint8_t>(h & 255u);
     }
 
     /**
@@ -365,15 +387,17 @@ private:
      * @param n Odd candidate that survived the prefilter.
      * @return @c true if @p n is prime, @c false otherwise.
      */
-    [[nodiscard]] static bool fj32_256(uint32_t n) noexcept
+    [[nodiscard]] static bool fj32_256(std::uint32_t n) noexcept
     {
-        const auto mulMod = [n](uint32_t a, uint32_t b) noexcept -> uint32_t {
-            return static_cast<uint32_t>(
-                (static_cast<uint64_t>(a) * static_cast<uint64_t>(b)) % n
+        const auto mulMod = [n](std::uint32_t a,
+                                std::uint32_t b) noexcept -> std::uint32_t {
+            return static_cast<std::uint32_t>(
+                (static_cast<std::uint_least64_t>(a) *
+                 static_cast<std::uint_least64_t>(b)) % n
             );
         };
 
-        uint32_t d = n - 1u;
+        std::uint32_t d = n - 1u;
         unsigned s = 0u;
 
         while ((d & 1u) == 0u) {
@@ -381,9 +405,9 @@ private:
             ++s;
         }
 
-        const uint32_t bucket = hashFj32_256(n);
-        const uint32_t base = static_cast<uint32_t>(fj32Bases[bucket]);
-        return !isWitness<uint32_t>(n, d, s, base, mulMod);
+        const std::uint32_t bucket = hashFj32_256(n);
+        const std::uint32_t base = static_cast<std::uint32_t>(fj32Bases[bucket]);
+        return !isWitness<std::uint32_t>(n, d, s, base, mulMod);
     }
 
     /**
@@ -391,15 +415,17 @@ private:
      *
      * Uses base set {2, 7, 61}, deterministic over the full @c uint32_t domain.
      */
-    [[nodiscard]] static bool millerRabin32(uint32_t n) noexcept
+    [[nodiscard]] static bool millerRabin32(std::uint32_t n) noexcept
     {
-        const auto mulMod = [n](uint32_t a, uint32_t b) noexcept -> uint32_t {
-            return static_cast<uint32_t>(
-                (static_cast<uint64_t>(a) * static_cast<uint64_t>(b)) % n
+        const auto mulMod = [n](std::uint32_t a,
+                                std::uint32_t b) noexcept -> std::uint32_t {
+            return static_cast<std::uint32_t>(
+                (static_cast<std::uint_least64_t>(a) *
+                 static_cast<std::uint_least64_t>(b)) % n
             );
         };
 
-        uint32_t d = n - 1u;
+        std::uint32_t d = n - 1u;
         unsigned s = 0u;
 
         while ((d & 1u) == 0u) {
@@ -407,15 +433,16 @@ private:
             ++s;
         }
 
-        static constexpr std::array<uint32_t, 3> bases{2u, 7u, 61u};
-        for (const uint32_t a : bases) {
-            if (isWitness<uint32_t>(n, d, s, a, mulMod))
+        static constexpr std::array<std::uint32_t, 3> bases{2u, 7u, 61u};
+        for (const std::uint32_t a : bases) {
+            if (isWitness<std::uint32_t>(n, d, s, a, mulMod))
                 return false;
         }
 
         return true;
     }
 
+#if UTILITIES_IS_PRIME_HAS_UINT64_OVERLOAD
     /**
      * @brief Deterministic Miller-Rabin backend for @c uint64_t.
      *
@@ -427,16 +454,17 @@ private:
      * @param n Odd candidate that survived the prefilter.
      * @return @c true if @p n is prime, @c false otherwise.
      */
-    [[nodiscard]] static bool millerRabin64(uint64_t n) noexcept
+    [[nodiscard]] static bool millerRabin64(std::uint64_t n) noexcept
     {
-        const auto mulMod = [n](uint64_t a, uint64_t b) noexcept -> uint64_t {
-            return static_cast<uint64_t>(
+        const auto mulMod = [n](std::uint64_t a,
+                                std::uint64_t b) noexcept -> std::uint64_t {
+            return static_cast<std::uint64_t>(
                 (static_cast<unsigned __int128>(a) *
                  static_cast<unsigned __int128>(b)) % n
             );
         };
 
-        uint64_t d = n - 1;
+        std::uint64_t d = n - 1;
         unsigned s = 0;
 
         while ((d & 1u) == 0u) {
@@ -444,18 +472,19 @@ private:
             ++s;
         }
 
-        static constexpr std::array<uint64_t, 7> bases{
+        static constexpr std::array<std::uint64_t, 7> bases{
             2ULL, 325ULL, 9375ULL, 28178ULL,
             450775ULL, 9780504ULL, 1795265022ULL
         };
 
-        for (const uint64_t a : bases) {
-            if (isWitness<uint64_t>(n, d, s, a, mulMod))
+        for (const std::uint64_t a : bases) {
+            if (isWitness<std::uint64_t>(n, d, s, a, mulMod))
                 return false;
         }
 
         return true;
     }
+#endif
 };
 
 /**
@@ -464,14 +493,15 @@ private:
  * This is the intended public API of this header.
  *
  * @code{.cpp}
- * #include <utilities/isPrime.h>
+ * #include <isPrime.h>
  *
- * bool p1 = utilities::isPrime(uint32_t{97});
- * bool p2 = utilities::isPrime(uint64_t{18446744073709551557ULL});
+ * bool p1 = utilities::isPrime(std::uint32_t{97});
  * @endcode
  */
 inline constexpr PrimalityTestFunctor isPrime{};
 
 } // namespace utilities
 
-// END File: include/utilities/isPrime.h
+#undef UTILITIES_IS_PRIME_HAS_UINT64_OVERLOAD
+
+// END File: include/isPrime.h
